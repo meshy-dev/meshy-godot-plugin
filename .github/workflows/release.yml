@@ -1,0 +1,73 @@
+name: Auto Release
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version number (e.g., 0.1.0)
+        default: "0.1.0"
+        required: true
+      is_prerelease:
+        type: boolean
+        description: Is this a pre-release?
+        default: false
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up version
+        id: set_version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          echo "Full version: $VERSION"
+          echo "FULL_VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Update version in plugin.cfg
+        run: |
+          sed -i "s/version=\".*\"/version=\"${{ env.FULL_VERSION }}\"/" addons/meshy-godot-plugin/plugin.cfg
+
+      - name: Create release artifact
+        run: |
+          mkdir -p meshy-godot-plugin
+          cp -r addons/meshy-godot-plugin/* meshy-godot-plugin/
+          zip -r "meshy-godot-plugin-v${{ env.FULL_VERSION }}.zip" meshy-godot-plugin \
+            --exclude "*.git*" \
+            --exclude "*.DS_Store" \
+            --exclude "*__pycache__*" \
+            --exclude "*.log"
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: v${{ env.FULL_VERSION }}
+          release_name: Meshy Godot Plugin v${{ env.FULL_VERSION }}
+          body: |
+            Meshy Godot Plugin v${{ env.FULL_VERSION }}
+
+            This release contains the Meshy Godot plugin for browsing assets and Text to Texture generation.
+
+            Minimum Godot version required: 4.2.0
+          draft: false
+          prerelease: ${{ inputs.is_prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./meshy-godot-plugin-v${{ env.FULL_VERSION }}.zip
+          asset_name: meshy-godot-plugin-v${{ env.FULL_VERSION }}.zip
+          asset_content_type: application/zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
