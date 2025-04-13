@@ -1,0 +1,29 @@
+[gd_scene load_steps=2 format=3 uid="uid://dmps0r8g8ui3g"]
+
+[ext_resource type="Script" path="res://addons/meshy-godot-plugin/main_scripts.gd" id="1_k1vgl"]
+
+[node name="MainPanel" type="CenterContainer"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+size_flags_vertical = 3
+script = ExtResource("1_k1vgl")
+
+[node name="VBoxContainer" type="VBoxContainer" parent="."]
+layout_mode = 2
+
+[node name="StatusLabel" type="Label" parent="VBoxContainer"]
+layout_mode = 2
+
+[node name="Bridge" type="Button" parent="VBoxContainer"]
+layout_mode = 2
+text = "Run Meshy Bridge"
+
+[node name="OpenMeshy" type="Button" parent="VBoxContainer"]
+layout_mode = 2
+text = "Open Meshy Editor"
+
+[connection signal="pressed" from="VBoxContainer/Bridge" to="." method="_on_run_bridge_pressed"]
+[connection signal="pressed" from="VBoxContainer/OpenMeshy" to="." method="_on_open_meshy_pressed"]
