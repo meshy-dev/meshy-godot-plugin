@@ -253,12 +253,12 @@ func _wait_for_file_recognition(file_path: String) -> void:
 
 # 添加新函数，继续导入过程
 func _continue_import(file_path: String) -> void:
-	# 从file_path提取json_payload信息
-	var format = file_path.get_extension()
+	# 从file_path提取json_payload信息 (仅提取name)
+	# var format = file_path.get_extension() # 不再依赖扩展名
 	var name = file_path.get_file().get_basename()
 	
 	var json_payload = {
-		"format": format,
+		# "format": format, # 格式将在_import_model中检测
 		"name": name
 	}
 	
@@ -266,18 +266,51 @@ func _continue_import(file_path: String) -> void:
 	_import_model(file_path, json_payload)
 
 func _import_model(file_path, json_payload):
-	print("准备导入模型: ", file_path, " 格式: ", json_payload.format)
-	match json_payload.format:
-		"glb", "gltf":
+	print("准备检测并导入模型: ", file_path)
+	
+	var file = FileAccess.open(file_path, FileAccess.READ)
+	if not file:
+		print("错误: 无法打开文件进行类型检测: ", file_path)
+		return
+		
+	# 读取文件头部的魔数
+	var magic_bytes = file.get_buffer(4)
+	file.close() # 检测后关闭文件
+	
+	var detected_format = ""
+	
+	if magic_bytes.size() >= 4:
+		# 检查GLB魔数 "glTF" (0x676C5446)
+		if magic_bytes[0] == 0x67 and magic_bytes[1] == 0x6C and magic_bytes[2] == 0x54 and magic_bytes[3] == 0x46:
+			detected_format = "glb"
+		# 检查ZIP魔数 "PK" (0x504B) - 只需要前两个字节
+		elif magic_bytes[0] == 0x50 and magic_bytes[1] == 0x4B:
+			detected_format = "zip"
+			
+	if detected_format.is_empty():
+		# 如果无法识别，尝试使用原始payload中的格式（作为后备）
+		# 或者直接报错
+		print("错误: 未知的或不支持的文件格式. 魔数: ", magic_bytes.hex_encode())
+		# 如果json_payload包含原始格式，可以在这里使用它作为后备
+		# if json_payload.has("format"):
+		#    detected_format = json_payload.format
+		# else:
+		#    return # 或者直接返回
+		return
+
+	print("检测到的文件格式: ", detected_format)
+	
+	# 使用检测到的格式进行处理
+	match detected_format:
+		"glb", "gltf": # 仍然处理 gltf 以防万一，尽管魔数是 glb
 			_import_gltf(file_path, json_payload.name)
 		"zip":
 			_import_zip(file_path, json_payload.name)
 		_:
-			print("不支持的格式: ", json_payload.format)
-	
+			print("不支持的格式（逻辑错误）: ", detected_format)
 
 func _import_gltf(file_path, name):
-	print("开始导入GLTF")
+	print("开始导入GLTF/GLB")
 	
 	# 检查编辑器接口
 	if not editor_interface:
@@ -377,7 +410,85 @@ func _count_children(node):
 	return count
 
 func _import_zip(file_path, name):
-	# TODO: unzip and import glb
-	print("导入ZIP: ", file_path, " 名称: ", name)
+	print("开始处理ZIP文件: ", file_path, " 名称: ", name)
 	
+	var zip_reader = ZIPReader.new()
+	var err = zip_reader.open(file_path)
+	
+	if err != OK:
+		print("错误: 无法打开ZIP文件: ", err)
+		return
+
+	var files_in_zip = zip_reader.get_files()
+	if files_in_zip.is_empty():
+		print("警告: ZIP文件为空.")
+		zip_reader.close()
+		return
+
+	# 创建解压目标目录
+	var base_extract_dir = "res://imported_models"
+	var extract_dir_name = "extracted_%s_%d" % [name, Time.get_unix_time_from_system()]
+	var extract_path = base_extract_dir.path_join(extract_dir_name)
+	
+	var dir_access = DirAccess.open("res://")
+	if not dir_access:
+		print("错误: 无法访问资源目录")
+		zip_reader.close()
+		return
+		
+	err = dir_access.make_dir_recursive(extract_path)
+	if err != OK:
+		print("错误: 无法创建解压目录: ", extract_path, " 错误码: ", err)
+		zip_reader.close()
+		return
+
+	print("解压到目录: ", extract_path)
+
+	# 提取文件
+	for file_in_zip in files_in_zip:
+		var file_data = zip_reader.read_file(file_in_zip)
+		var target_file_path = extract_path.path_join(file_in_zip)
+		
+		# 确保目标文件的父目录存在 (处理ZIP内的目录结构)
+		var target_dir = target_file_path.get_base_dir()
+		if not DirAccess.dir_exists_absolute(target_dir):
+			err = dir_access.make_dir_recursive(target_dir)
+			if err != OK:
+				print("警告: 无法创建子目录: ", target_dir, " 文件: ", file_in_zip)
+				continue # 跳过这个文件
+
+		# 写入文件
+		var file_access = FileAccess.open(target_file_path, FileAccess.WRITE)
+		if file_access:
+			file_access.store_buffer(file_data)
+			file_access.close()
+			# print("已解压: ", target_file_path)
+		else:
+			print("错误: 无法写入解压文件: ", target_file_path)
+
+	zip_reader.close()
+	print("ZIP文件解压完成: ", extract_path)
+	
+	# 手动触发文件系统扫描以确保编辑器识别新文件
+	if editor_interface:
+		print("正在刷新文件系统...")
+		var filesystem = editor_interface.get_resource_filesystem()
+		if filesystem:
+			filesystem.scan()
+			# 等待扫描完成可能需要一点时间，但我们这里不阻塞
+			print("文件系统扫描已触发.")
+		else:
+			print("警告: 无法获取文件系统接口.")
+	else:
+		print("警告: editor_interface 为 null，无法触发文件系统扫描.")
+
+	# 注意：ZIP文件只解压，不执行场景导入操作。
+	
+	# 删除原始的（可能错误命名的）ZIP文件
+	var remove_err = DirAccess.remove_absolute(file_path)
+	if remove_err == OK:
+		print("已成功删除原始ZIP文件: ", file_path)
+	else:
+		print("错误: 删除原始ZIP文件失败: ", file_path, " 错误码: ", remove_err)
+
 	
