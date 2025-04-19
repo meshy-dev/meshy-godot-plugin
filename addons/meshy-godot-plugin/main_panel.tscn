@@ -1,6 +1,6 @@
 [gd_scene load_steps=2 format=3 uid="uid://dmps0r8g8ui3g"]
 
-[ext_resource type="Script" path="res://addons/meshy-godot-plugin/main_scripts.gd" id="1_k1vgl"]
+[ext_resource type="Script" uid="uid://bpma7xvwlssl2" path="res://addons/meshy-godot-plugin/main_scripts.gd" id="1_k1vgl"]
 
 [node name="MainPanel" type="CenterContainer"]
 anchors_preset = 15

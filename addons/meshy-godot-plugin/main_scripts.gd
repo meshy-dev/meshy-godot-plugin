@@ -9,6 +9,9 @@ var editor_interface: EditorInterface
 
 func _ready():
 	tcp_server = TCPServer.new()
+	
+	# 检查editor_interface是否已初始化
+	print("_ready: editor_interface初始化状态: ", editor_interface != null)
 
 	# update status label
 	_update_status_label()
@@ -154,7 +157,7 @@ func _send_json_response(client, data, status_code = 200):
 	client.disconnect_from_host()
 
 func _download_and_import_file(json_payload):
-	# print("processing info: ", json_payload)
+	print("开始下载文件: ", json_payload.url, " 格式: ", json_payload.format)
 	
 	# download file
 	var http = HTTPRequest.new()
@@ -169,6 +172,8 @@ func _download_and_import_file(json_payload):
 		http.queue_free()
 
 func _on_download_completed(result, response_code, headers, body, json_payload):
+	print("下载完成: 结果=", result, " 响应码=", response_code, " 数据大小=", body.size())
+	
 	if result != HTTPRequest.RESULT_SUCCESS:
 		print("ERROR: download failed: ", result)
 		return
@@ -199,30 +204,69 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 			if editor_interface:
 				var filesystem = editor_interface.get_resource_filesystem()
 				filesystem.scan()
-				filesystem.scan_sources()
-			# wait for file recognition
-			await _wait_for_file_recognition(file_path)
-
 			
-			# import model
-			_import_model(file_path, json_payload)
+			# 使用非await方式等待文件识别
+			_wait_for_file_recognition(file_path)
 		else:
 			print("ERROR: file not found: ", file_path)
 	else:
 		print("ERROR: cannot save file: ", file_path)
 
-# wait for file recognition
+# 修改_wait_for_file_recognition函数，使用Timer和信号而不是await
 func _wait_for_file_recognition(file_path: String) -> void:
+	print("等待文件识别: ", file_path)
+	
+	# 如果文件已经存在，直接继续
+	if ResourceLoader.exists(file_path):
+		print("文件已识别: ", file_path)
+		_continue_import(file_path)
+		return
+		
+	# 创建定时器
+	var timer = Timer.new()
+	timer.wait_time = 0.2
+	timer.one_shot = false
+	add_child(timer)
+	
+	# 设置计数器
+	var retry_count = 0
 	var max_retries = 10
-	var retry_delay = 0.2
 	
-	for i in range(max_retries):
+	# 连接超时信号
+	timer.timeout.connect(func():
+		retry_count += 1
+		print("等待文件识别中... 尝试次数: ", retry_count)
+		
 		if ResourceLoader.exists(file_path):
+			print("文件已识别: ", file_path)
+			timer.queue_free()
+			_continue_import(file_path)
 			return
-		await get_tree().create_timer(retry_delay).timeout
+			
+		if retry_count >= max_retries:
+			print("文件识别超时!")
+			timer.queue_free()
+	)
 	
+	# 启动定时器
+	timer.start()
+
+# 添加新函数，继续导入过程
+func _continue_import(file_path: String) -> void:
+	# 从file_path提取json_payload信息
+	var format = file_path.get_extension()
+	var name = file_path.get_file().get_basename()
+	
+	var json_payload = {
+		"format": format,
+		"name": name
+	}
+	
+	# 导入模型
+	_import_model(file_path, json_payload)
 
 func _import_model(file_path, json_payload):
+	print("准备导入模型: ", file_path, " 格式: ", json_payload.format)
 	match json_payload.format:
 		"glb", "gltf":
 			_import_gltf(file_path, json_payload.name)
@@ -233,25 +277,104 @@ func _import_model(file_path, json_payload):
 	
 
 func _import_gltf(file_path, name):
+	print("开始导入GLTF")
 	
-	var gltf = GLTFDocument.new()
-	var state = GLTFState.new()
-	var error = gltf.append_from_file(file_path, state)
-	# TODO: import to active scene
-	if error == OK:
-		var scene = gltf.generate_scene(state)
-		if scene:
-			# create a new node3d
-			var node3d = Node3D.new()
-			node3d.name = "Meshy_" + name if name else "Meshy_Model"
-			node3d.add_child(scene)
-			node3d.owner = get_tree().get_root()
-			node3d.visible = true
+	# 检查编辑器接口
+	if not editor_interface:
+		print("错误: editor_interface为null")
+		return
+		
+	# 检查场景根
+	var edited_scene_root = editor_interface.get_edited_scene_root()
+	if not edited_scene_root:
+		print("错误: 没有打开的场景")
+		return
+		
+	print("场景根节点: ", edited_scene_root.name)
+	
+	# 使用ResourceLoader加载场景
+	print("尝试直接使用ResourceLoader加载模型")
+	var resource = ResourceLoader.load(file_path, "", ResourceLoader.CACHE_MODE_REUSE)
+	
+	if resource:
+		print("资源加载成功: ", resource.get_class())
+		var scene_instance
+		
+		# 根据资源类型进行处理
+		if resource is PackedScene:
+			scene_instance = resource.instantiate()
+			print("场景实例化成功: ", scene_instance.get_class())
+		else:
+			print("资源不是PackedScene类型，无法实例化")
+			return
 			
-			get_tree().get_current_scene().add_child(node3d)
-			print("导入GLTF/GLB成功: ", file_path)
+		# 创建容器节点
+		var node3d = Node3D.new()
+		node3d.name = "Meshy_" + (name if name else "Model")
+		
+		# 添加到当前场景
+		edited_scene_root.add_child(node3d)
+		node3d.owner = edited_scene_root
+		
+		# 添加导入的场景
+		node3d.add_child(scene_instance)
+		_recursive_set_owner(scene_instance, edited_scene_root)
+		
+		print("模型添加到场景成功")
+		
+		# 通知编辑器刷新和选择新节点
+		editor_interface.get_selection().clear()
+		editor_interface.get_selection().add_node(node3d)
+		
+		print("导入GLTF/GLB成功: ", file_path)
 	else:
-		print("导入GLTF/GLB失败: ", error)
+		print("资源加载失败，尝试使用GLTFDocument")
+		
+		# 原来的导入逻辑保留为备选方案
+		var gltf = GLTFDocument.new()
+		var state = GLTFState.new()
+		var error = gltf.append_from_file(file_path, state)
+		
+		if error == OK:
+			var scene = gltf.generate_scene(state)
+			if scene:
+				# 创建容器
+				var node3d = Node3D.new()
+				node3d.name = "Meshy_" + (name if name else "Model")
+				
+				# 添加到当前场景
+				edited_scene_root.add_child(node3d)
+				node3d.owner = edited_scene_root
+				
+				print("添加容器节点: ", node3d.name)
+				
+				# 添加导入的场景
+				node3d.add_child(scene)
+				_recursive_set_owner(scene, edited_scene_root)
+				
+				print("导入完成，节点数量: ", _count_children(scene))
+				
+				# 标记场景为已修改，以便保存
+				edited_scene_root.set_meta("__editor_changed", true)
+				
+				print("导入GLTF/GLB成功: ", file_path)
+			else:
+				print("错误: 场景生成失败")
+		else:
+			print("导入GLTF/GLB失败，错误码: ", error)
+
+# 递归设置所有节点的所有权
+func _recursive_set_owner(node, owner):
+	for child in node.get_children():
+		child.owner = owner
+		_recursive_set_owner(child, owner)
+
+# 计算子节点数量的辅助函数
+func _count_children(node):
+	var count = 0
+	for child in node.get_children():
+		count += 1 + _count_children(child)
+	return count
 
 func _import_zip(file_path, name):
 	# TODO: unzip and import glb
