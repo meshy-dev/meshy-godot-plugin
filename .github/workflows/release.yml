@@ -37,8 +37,6 @@ jobs:
 
       - name: Create release artifact
         run: |
-          mkdir -p meshy-godot-plugin
-          cp -r meshy-godot-plugin/* meshy-godot-plugin/
           zip -r "meshy-godot-plugin-v${{ env.FULL_VERSION }}.zip" meshy-godot-plugin \
             --exclude "*.git*" \
             --exclude "*.DS_Store" \
