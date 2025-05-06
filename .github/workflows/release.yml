@@ -33,12 +33,10 @@ jobs:
 
       - name: Update version in plugin.cfg
         run: |
-          sed -i "s/version=\".*\"/version=\"${{ env.FULL_VERSION }}\"/" addons/meshy-godot-plugin/plugin.cfg
+          sed -i "s/version=\".*\"/version=\"${{ env.FULL_VERSION }}\"/" meshy-godot-plugin/plugin.cfg
 
       - name: Create release artifact
         run: |
-          mkdir -p meshy-godot-plugin
-          cp -r addons/meshy-godot-plugin/* meshy-godot-plugin/
           zip -r "meshy-godot-plugin-v${{ env.FULL_VERSION }}.zip" meshy-godot-plugin \
             --exclude "*.git*" \
             --exclude "*.DS_Store" \
