@@ -325,45 +325,46 @@ func _import_gltf(file_path, name):
 		
 	print("场景根节点: ", edited_scene_root.name)
 	
+	# 创建容器节点
+	var container = Node3D.new()
+	container.name = "Meshy_" + (name if name else "Model")
+	
+	# 添加到当前场景
+	edited_scene_root.add_child(container)
+	container.owner = edited_scene_root
+	
 	# 使用ResourceLoader加载场景
-	print("尝试直接使用ResourceLoader加载模型")
+	print("加载模型: ", file_path)
 	var resource = ResourceLoader.load(file_path, "", ResourceLoader.CACHE_MODE_REUSE)
 	
 	if resource:
 		print("资源加载成功: ", resource.get_class())
-		var scene_instance
 		
 		# 根据资源类型进行处理
 		if resource is PackedScene:
-			scene_instance = resource.instantiate()
+			# 实例化场景
+			var scene_instance = resource.instantiate()
 			print("场景实例化成功: ", scene_instance.get_class())
+			
+			# 添加到容器
+			container.add_child(scene_instance)
+			
+			# 递归设置所有节点的所有权为场景根
+			_recursive_set_owner(scene_instance, edited_scene_root)
+			
+			# 将实例保存为场景中的本地资源
+			print("将实例转换为本地资源")
+			scene_instance.owner = edited_scene_root
+			
+			# 将动画和材质等资源转为本地
+			_make_resources_local(scene_instance)
 		else:
 			print("资源不是PackedScene类型，无法实例化")
+			container.queue_free()
 			return
-			
-		# 创建容器节点
-		var node3d = Node3D.new()
-		node3d.name = "Meshy_" + (name if name else "Model")
-		
-		# 添加到当前场景
-		edited_scene_root.add_child(node3d)
-		node3d.owner = edited_scene_root
-		
-		# 添加导入的场景
-		node3d.add_child(scene_instance)
-		_recursive_set_owner(scene_instance, edited_scene_root)
-		
-		print("模型添加到场景成功")
-		
-		# 通知编辑器刷新和选择新节点
-		editor_interface.get_selection().clear()
-		editor_interface.get_selection().add_node(node3d)
-		
-		print("导入GLTF/GLB成功: ", file_path)
 	else:
 		print("资源加载失败，尝试使用GLTFDocument")
 		
-		# 原来的导入逻辑保留为备选方案
 		var gltf = GLTFDocument.new()
 		var state = GLTFState.new()
 		var error = gltf.append_from_file(file_path, state)
@@ -371,30 +372,78 @@ func _import_gltf(file_path, name):
 		if error == OK:
 			var scene = gltf.generate_scene(state)
 			if scene:
-				# 创建容器
-				var node3d = Node3D.new()
-				node3d.name = "Meshy_" + (name if name else "Model")
+				# 添加到容器
+				container.add_child(scene)
 				
-				# 添加到当前场景
-				edited_scene_root.add_child(node3d)
-				node3d.owner = edited_scene_root
-				
-				print("添加容器节点: ", node3d.name)
-				
-				# 添加导入的场景
-				node3d.add_child(scene)
+				# 设置所有权
 				_recursive_set_owner(scene, edited_scene_root)
 				
-				print("导入完成，节点数量: ", _count_children(scene))
+				# 将动画和材质等资源转为本地
+				_make_resources_local(scene)
 				
-				# 标记场景为已修改，以便保存
-				edited_scene_root.set_meta("__editor_changed", true)
-				
-				print("导入GLTF/GLB成功: ", file_path)
+				print("GLTFDocument导入成功")
 			else:
 				print("错误: 场景生成失败")
+				container.queue_free()
+				return
 		else:
 			print("导入GLTF/GLB失败，错误码: ", error)
+			container.queue_free()
+			return
+	
+	# 通知编辑器刷新和选择新节点
+	editor_interface.get_selection().clear()
+	editor_interface.get_selection().add_node(container)
+	
+	# 标记场景为已修改，以便保存
+	edited_scene_root.set_meta("__editor_changed", true)
+	
+	print("导入GLTF/GLB成功: ", file_path)
+
+# 将节点及其子节点中的所有资源转为本地资源
+func _make_resources_local(node):
+	# 检查并处理动画播放器
+	if node is AnimationPlayer:
+		_make_animations_local(node)
+	
+	# 处理网格实例
+	if node is MeshInstance3D:
+		_make_mesh_local(node)
+	
+	# 递归处理所有子节点
+	for child in node.get_children():
+		_make_resources_local(child)
+
+# 将动画播放器中的动画转为本地资源
+func _make_animations_local(anim_player):
+	var animation_names = anim_player.get_animation_list()
+	for anim_name in animation_names:
+		var animation = anim_player.get_animation(anim_name)
+		if animation:
+			# 制作动画的副本并替换原始动画
+			var local_animation = animation.duplicate()
+			anim_player.remove_animation(anim_name)
+			anim_player.add_animation(anim_name, local_animation)
+			print("动画已转为本地: ", anim_name)
+
+# 将网格实例中的网格和材质转为本地资源
+func _make_mesh_local(mesh_instance):
+	var mesh = mesh_instance.mesh
+	if mesh:
+		# 制作网格的副本
+		var local_mesh = mesh.duplicate()
+		mesh_instance.mesh = local_mesh
+		
+		# 处理网格中的材质
+		var material_count = local_mesh.get_surface_count()
+		for i in range(material_count):
+			var material = local_mesh.surface_get_material(i)
+			if material:
+				# 制作材质的副本
+				var local_material = material.duplicate()
+				local_mesh.surface_set_material(i, local_material)
+		
+		print("网格和材质已转为本地")
 
 # 递归设置所有节点的所有权
 func _recursive_set_owner(node, owner):
