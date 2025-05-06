@@ -16,7 +16,6 @@ layout_mode = 2
 
 [node name="StatusLabel" type="Label" parent="VBoxContainer"]
 layout_mode = 2
-text = "Bridge: Stopped"
 
 [node name="Bridge" type="Button" parent="VBoxContainer"]
 layout_mode = 2

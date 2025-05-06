@@ -38,3 +38,4 @@ func _get_plugin_icon() -> Texture2D:
 	if icon:
 		return icon
 	return get_editor_interface().get_base_control().get_theme_icon("Node", "EditorIcons")
+
