@@ -1,7 +1,7 @@
 @tool
 extends EditorPlugin
 
-const MainPanel = preload("res://addons/meshy-godot-plugin/main_panel.tscn")
+const MainPanel = preload("res://addons/meshy-godot-plugin/meshy-godot-plugin/main_panel.tscn")
 
 var main_panel_instance: CenterContainer
 
@@ -34,8 +34,7 @@ func _get_plugin_name() -> String:
 
 
 func _get_plugin_icon() -> Texture2D:
-	var icon = preload("res://addons/meshy-godot-plugin/Meshy_Icon_36.png")
+	var icon = preload("res://addons/meshy-godot-plugin/meshy-godot-plugin/Meshy_Icon_36.png")
 	if icon:
 		return icon
 	return get_editor_interface().get_base_control().get_theme_icon("Node", "EditorIcons")
-

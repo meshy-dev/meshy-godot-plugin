@@ -3,15 +3,15 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://do40uj7voqbij"
-path="res://.godot/imported/Meshy_Icon_36.png-45bf9fe5e79948bd21fa2b9d42bb6f48.ctex"
+path="res://.godot/imported/Meshy_Icon_36.png-c5c8dc56fe02d02e48cddbcd2e5655fc.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://addons/meshy-godot-plugin/Meshy_Icon_36.png"
-dest_files=["res://.godot/imported/Meshy_Icon_36.png-45bf9fe5e79948bd21fa2b9d42bb6f48.ctex"]
+source_file="res://addons/meshy-godot-plugin/meshy-godot-plugin/Meshy_Icon_36.png"
+dest_files=["res://.godot/imported/Meshy_Icon_36.png-c5c8dc56fe02d02e48cddbcd2e5655fc.ctex"]
 
 [params]
 

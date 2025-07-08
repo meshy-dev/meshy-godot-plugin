@@ -273,29 +273,29 @@ func _import_model(file_path, json_payload):
 		print("错误: 无法打开文件进行类型检测: ", file_path)
 		return
 		
-	# 读取文件头部的魔数
-	var magic_bytes = file.get_buffer(4)
+	# 读取文件头部的魔数 (读取更多字节以检测FBX)
+	var magic_bytes = file.get_buffer(21) # FBX magic number is 21 bytes long
 	file.close() # 检测后关闭文件
 	
 	var detected_format = ""
 	
-	if magic_bytes.size() >= 4:
-		# 检查GLB魔数 "glTF" (0x676C5446)
-		if magic_bytes[0] == 0x67 and magic_bytes[1] == 0x6C and magic_bytes[2] == 0x54 and magic_bytes[3] == 0x46:
-			detected_format = "glb"
-		# 检查ZIP魔数 "PK" (0x504B) - 只需要前两个字节
-		elif magic_bytes[0] == 0x50 and magic_bytes[1] == 0x4B:
-			detected_format = "zip"
+	if magic_bytes.size() >= 21: # Check for FBX magic number
+		# FBX Magic Number: "Kaydara FBX Binary  \x00"
+		var fbx_magic = PackedByteArray([0x4B, 0x61, 0x79, 0x64, 0x61, 0x72, 0x61, 0x20, 0x46, 0x42, 0x58, 0x20, 0x42, 0x69, 0x6E, 0x61, 0x72, 0x79, 0x20, 0x20, 0x00])
+		if magic_bytes.slice(0, 21) == fbx_magic:
+			detected_format = "fbx"
+	
+	if detected_format.is_empty(): # Only check for GLB and ZIP if FBX isn't detected
+		if magic_bytes.size() >= 4:
+			# 检查GLB魔数 "glTF" (0x676C5446)
+			if magic_bytes[0] == 0x67 and magic_bytes[1] == 0x6C and magic_bytes[2] == 0x54 and magic_bytes[3] == 0x46:
+				detected_format = "glb"
+			# 检查ZIP魔数 "PK" (0x504B) - 只需要前两个字节
+			elif magic_bytes[0] == 0x50 and magic_bytes[1] == 0x4B:
+				detected_format = "zip"
 			
 	if detected_format.is_empty():
-		# 如果无法识别，尝试使用原始payload中的格式（作为后备）
-		# 或者直接报错
 		print("错误: 未知的或不支持的文件格式. 魔数: ", magic_bytes.hex_encode())
-		# 如果json_payload包含原始格式，可以在这里使用它作为后备
-		# if json_payload.has("format"):
-		#    detected_format = json_payload.format
-		# else:
-		#    return # 或者直接返回
 		return
 
 	print("检测到的文件格式: ", detected_format)
@@ -304,6 +304,8 @@ func _import_model(file_path, json_payload):
 	match detected_format:
 		"glb", "gltf": # 仍然处理 gltf 以防万一，尽管魔数是 glb
 			_import_gltf(file_path, json_payload.name)
+		"fbx":
+			_import_fbx(file_path, json_payload.name)
 		"zip":
 			_import_zip(file_path, json_payload.name)
 		_:
@@ -400,6 +402,87 @@ func _import_gltf(file_path, name):
 	
 	print("导入GLTF/GLB成功: ", file_path)
 
+func _import_fbx(file_path, name):
+	print("开始导入FBX")
+	
+	# 检查编辑器接口
+	if not editor_interface:
+		print("错误: editor_interface为null")
+		return
+		
+	# 检查场景根
+	var edited_scene_root = editor_interface.get_edited_scene_root()
+	if not edited_scene_root:
+		print("错误: 没有打开的场景")
+		return
+		
+	print("场景根节点: ", edited_scene_root.name)
+	
+	# 创建容器节点
+	var container = Node3D.new()
+	container.name = "Meshy_" + (name if name else "Model")
+	
+	# 添加到当前场景
+	edited_scene_root.add_child(container)
+	container.owner = edited_scene_root
+	
+	# 使用ResourceLoader加载场景
+	print("加载模型: ", file_path)
+	# Godot 4.x has native FBX import support
+	
+	var resource = null
+	var retry_count = 0
+	var max_retries = 10 # Max retries
+	var retry_delay = 0.2 # seconds
+	
+	# Try loading the resource with retries
+	while retry_count < max_retries:
+		resource = ResourceLoader.load(file_path, "", ResourceLoader.CACHE_MODE_REUSE)
+		if resource:
+			print("资源加载成功 (尝试次数: ", retry_count + 1, "): ", resource.get_class())
+			break # Successfully loaded, exit loop
+		
+		print("资源加载失败，重试... (尝试次数: ", retry_count + 1, ")")
+		retry_count += 1
+		await get_tree().create_timer(retry_delay).timeout # Wait before retrying
+		
+	if resource:
+		# 根据资源类型进行处理
+		if resource is PackedScene:
+			# 实例化场景
+			var scene_instance = resource.instantiate()
+			print("场景实例化成功: ", scene_instance.get_class())
+			
+			# 添加到容器
+			container.add_child(scene_instance)
+			
+			# 递归设置所有节点的所有权为场景根
+			_recursive_set_owner(scene_instance, edited_scene_root)
+			
+			# 将实例保存为场景中的本地资源
+			print("将实例转换为本地资源")
+			scene_instance.owner = edited_scene_root
+			
+			# 将动画和材质等资源转为本地
+			_make_resources_local(scene_instance)
+		else:
+			print("资源不是PackedScene类型，无法实例化")
+			container.queue_free()
+			return
+	else:
+		print("导入FBX失败: 无法加载资源 (达到最大重试次数). 请确保FBX导入器已正确设置或文件有效.")
+		container.queue_free()
+		return
+	
+	# 通知编辑器刷新和选择新节点
+	editor_interface.get_selection().clear()
+	editor_interface.get_selection().add_node(container)
+	
+	# 标记场景为已修改，以便保存
+	edited_scene_root.set_meta("__editor_changed", true)
+	
+	print("导入FBX成功: ", file_path)
+
 # 将节点及其子节点中的所有资源转为本地资源
 func _make_resources_local(node):
 	# 检查并处理动画播放器
@@ -493,6 +576,9 @@ func _import_zip(file_path, name):
 
 	print("解压到目录: ", extract_path)
 
+	var fbx_found = false
+	var extracted_fbx_path = ""
+
 	# 提取文件
 	for file_in_zip in files_in_zip:
 		var file_data = zip_reader.read_file(file_in_zip)
@@ -511,7 +597,12 @@ func _import_zip(file_path, name):
 		if file_access:
 			file_access.store_buffer(file_data)
 			file_access.close()
-			# print("已解压: ", target_file_path)
+			print("已解压: ", target_file_path)
+			
+			# 检查是否是FBX文件
+			if file_in_zip.get_extension().to_lower() == "fbx":
+				fbx_found = true
+				extracted_fbx_path = target_file_path
 		else:
 			print("错误: 无法写入解压文件: ", target_file_path)
 
@@ -524,14 +615,23 @@ func _import_zip(file_path, name):
 		var filesystem = editor_interface.get_resource_filesystem()
 		if filesystem:
 			filesystem.scan()
-			# 等待扫描完成可能需要一点时间，但我们这里不阻塞
 			print("文件系统扫描已触发.")
 		else:
 			print("警告: 无法获取文件系统接口.")
 	else:
 		print("警告: editor_interface 为 null，无法触发文件系统扫描.")
 
-	# 注意：ZIP文件只解压，不执行场景导入操作。
+	# 如果在ZIP中找到FBX文件，则导入它
+	if fbx_found:
+		print("在ZIP中找到FBX文件，开始导入: ", extracted_fbx_path)
+		# 从extracted_fbx_path提取json_payload信息 (仅提取name)
+		var fbx_name = extracted_fbx_path.get_file().get_basename()
+		var fbx_json_payload = {
+			"name": fbx_name
+		}
+		_import_fbx(extracted_fbx_path, fbx_json_payload.name)
+	else:
+		print("警告: ZIP文件中未找到FBX模型. 跳过模型导入.")
 	
 	# 删除原始的（可能错误命名的）ZIP文件
 	var remove_err = DirAccess.remove_absolute(file_path)
