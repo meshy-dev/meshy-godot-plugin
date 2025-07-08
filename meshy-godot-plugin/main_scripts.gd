@@ -11,7 +11,7 @@ func _ready():
 	tcp_server = TCPServer.new()
 	
 	# 检查editor_interface是否已初始化
-	print("_ready: editor_interface初始化状态: ", editor_interface != null)
+	print("_ready: editor_interface initialization status: ", editor_interface != null)
 
 	# update status label
 	_update_status_label()
@@ -157,7 +157,7 @@ func _send_json_response(client, data, status_code = 200):
 	client.disconnect_from_host()
 
 func _download_and_import_file(json_payload):
-	print("开始下载文件: ", json_payload.url, " 格式: ", json_payload.format)
+	print("Starting file download: ", json_payload.url, " format: ", json_payload.format)
 	
 	# download file
 	var http = HTTPRequest.new()
@@ -172,7 +172,7 @@ func _download_and_import_file(json_payload):
 		http.queue_free()
 
 func _on_download_completed(result, response_code, headers, body, json_payload):
-	print("下载完成: 结果=", result, " 响应码=", response_code, " 数据大小=", body.size())
+	print("Download completed: result=", result, " response_code=", response_code, " data_size=", body.size())
 	
 	if result != HTTPRequest.RESULT_SUCCESS:
 		print("ERROR: download failed: ", result)
@@ -214,11 +214,11 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 
 # 修改_wait_for_file_recognition函数，使用Timer和信号而不是await
 func _wait_for_file_recognition(file_path: String) -> void:
-	print("等待文件识别: ", file_path)
+	print("Waiting for file recognition: ", file_path)
 	
 	# 如果文件已经存在，直接继续
 	if ResourceLoader.exists(file_path):
-		print("文件已识别: ", file_path)
+		print("File recognized: ", file_path)
 		_continue_import(file_path)
 		return
 		
@@ -235,16 +235,16 @@ func _wait_for_file_recognition(file_path: String) -> void:
 	# 连接超时信号
 	timer.timeout.connect(func():
 		retry_count += 1
-		print("等待文件识别中... 尝试次数: ", retry_count)
+		print("Waiting for file recognition... Attempts: ", retry_count)
 		
 		if ResourceLoader.exists(file_path):
-			print("文件已识别: ", file_path)
+			print("File recognized: ", file_path)
 			timer.queue_free()
 			_continue_import(file_path)
 			return
 			
 		if retry_count >= max_retries:
-			print("文件识别超时!")
+			print("File recognition timeout!")
 			timer.queue_free()
 	)
 	
@@ -266,11 +266,11 @@ func _continue_import(file_path: String) -> void:
 	_import_model(file_path, json_payload)
 
 func _import_model(file_path, json_payload):
-	print("准备检测并导入模型: ", file_path)
+	print("Preparing to detect and import model: ", file_path)
 	
 	var file = FileAccess.open(file_path, FileAccess.READ)
 	if not file:
-		print("错误: 无法打开文件进行类型检测: ", file_path)
+		print("ERROR: Cannot open file for type detection: ", file_path)
 		return
 		
 	# 读取文件头部的魔数 (读取更多字节以检测FBX)
@@ -295,10 +295,10 @@ func _import_model(file_path, json_payload):
 				detected_format = "zip"
 			
 	if detected_format.is_empty():
-		print("错误: 未知的或不支持的文件格式. 魔数: ", magic_bytes.hex_encode())
+		print("ERROR: Unknown or unsupported file format. Magic bytes: ", magic_bytes.hex_encode())
 		return
 
-	print("检测到的文件格式: ", detected_format)
+	print("Detected file format: ", detected_format)
 	
 	# 使用检测到的格式进行处理
 	match detected_format:
@@ -309,23 +309,23 @@ func _import_model(file_path, json_payload):
 		"zip":
 			_import_zip(file_path, json_payload.name)
 		_:
-			print("不支持的格式（逻辑错误）: ", detected_format)
+			print("Unsupported format (logical error): ", detected_format)
 
 func _import_gltf(file_path, name):
-	print("开始导入GLTF/GLB")
+	print("Starting GLTF/GLB import")
 	
 	# 检查编辑器接口
 	if not editor_interface:
-		print("错误: editor_interface为null")
+		print("ERROR: editor_interface is null")
 		return
 		
 	# 检查场景根
 	var edited_scene_root = editor_interface.get_edited_scene_root()
 	if not edited_scene_root:
-		print("错误: 没有打开的场景")
+		print("ERROR: No open scene")
 		return
 		
-	print("场景根节点: ", edited_scene_root.name)
+	print("Scene root node: ", edited_scene_root.name)
 	
 	# 创建容器节点
 	var container = Node3D.new()
@@ -336,17 +336,17 @@ func _import_gltf(file_path, name):
 	container.owner = edited_scene_root
 	
 	# 使用ResourceLoader加载场景
-	print("加载模型: ", file_path)
+	print("Loading model: ", file_path)
 	var resource = ResourceLoader.load(file_path, "", ResourceLoader.CACHE_MODE_REUSE)
 	
 	if resource:
-		print("资源加载成功: ", resource.get_class())
+		print("Resource loaded successfully: ", resource.get_class())
 		
 		# 根据资源类型进行处理
 		if resource is PackedScene:
 			# 实例化场景
 			var scene_instance = resource.instantiate()
-			print("场景实例化成功: ", scene_instance.get_class())
+			print("Scene instantiated successfully: ", scene_instance.get_class())
 			
 			# 添加到容器
 			container.add_child(scene_instance)
@@ -355,17 +355,17 @@ func _import_gltf(file_path, name):
 			_recursive_set_owner(scene_instance, edited_scene_root)
 			
 			# 将实例保存为场景中的本地资源
-			print("将实例转换为本地资源")
+			print("Converting instance to local resource")
 			scene_instance.owner = edited_scene_root
 			
 			# 将动画和材质等资源转为本地
 			_make_resources_local(scene_instance)
 		else:
-			print("资源不是PackedScene类型，无法实例化")
+			print("Resource is not PackedScene type, cannot instantiate")
 			container.queue_free()
 			return
 	else:
-		print("资源加载失败，尝试使用GLTFDocument")
+		print("Resource loading failed, attempting with GLTFDocument")
 		
 		var gltf = GLTFDocument.new()
 		var state = GLTFState.new()
@@ -383,13 +383,13 @@ func _import_gltf(file_path, name):
 				# 将动画和材质等资源转为本地
 				_make_resources_local(scene)
 				
-				print("GLTFDocument导入成功")
+				print("GLTFDocument import successful")
 			else:
-				print("错误: 场景生成失败")
+				print("ERROR: Scene generation failed")
 				container.queue_free()
 				return
 		else:
-			print("导入GLTF/GLB失败，错误码: ", error)
+			print("GLTF/GLB import failed, error code: ", error)
 			container.queue_free()
 			return
 	
@@ -400,23 +400,23 @@ func _import_gltf(file_path, name):
 	# 标记场景为已修改，以便保存
 	edited_scene_root.set_meta("__editor_changed", true)
 	
-	print("导入GLTF/GLB成功: ", file_path)
+	print("GLTF/GLB import successful: ", file_path)
 
 func _import_fbx(file_path, name):
-	print("开始导入FBX")
+	print("Starting FBX import")
 	
 	# 检查编辑器接口
 	if not editor_interface:
-		print("错误: editor_interface为null")
+		print("ERROR: editor_interface is null")
 		return
 		
 	# 检查场景根
 	var edited_scene_root = editor_interface.get_edited_scene_root()
 	if not edited_scene_root:
-		print("错误: 没有打开的场景")
+		print("ERROR: No open scene")
 		return
 		
-	print("场景根节点: ", edited_scene_root.name)
+	print("Scene root node: ", edited_scene_root.name)
 	
 	# 创建容器节点
 	var container = Node3D.new()
@@ -427,7 +427,7 @@ func _import_fbx(file_path, name):
 	container.owner = edited_scene_root
 	
 	# 使用ResourceLoader加载场景
-	print("加载模型: ", file_path)
+	print("Loading model: ", file_path)
 	# Godot 4.x has native FBX import support
 	
 	var resource = null
@@ -439,10 +439,10 @@ func _import_fbx(file_path, name):
 	while retry_count < max_retries:
 		resource = ResourceLoader.load(file_path, "", ResourceLoader.CACHE_MODE_REUSE)
 		if resource:
-			print("资源加载成功 (尝试次数: ", retry_count + 1, "): ", resource.get_class())
+			print("Resource loaded successfully (attempts: ", retry_count + 1, "): ", resource.get_class())
 			break # Successfully loaded, exit loop
 		
-		print("资源加载失败，重试... (尝试次数: ", retry_count + 1, ")")
+		print("Resource loading failed, retrying... (attempts: ", retry_count + 1, ")")
 		retry_count += 1
 		await get_tree().create_timer(retry_delay).timeout # Wait before retrying
 		
@@ -451,7 +451,7 @@ func _import_fbx(file_path, name):
 		if resource is PackedScene:
 			# 实例化场景
 			var scene_instance = resource.instantiate()
-			print("场景实例化成功: ", scene_instance.get_class())
+			print("Scene instantiated successfully: ", scene_instance.get_class())
 			
 			# 添加到容器
 			container.add_child(scene_instance)
@@ -460,17 +460,17 @@ func _import_fbx(file_path, name):
 			_recursive_set_owner(scene_instance, edited_scene_root)
 			
 			# 将实例保存为场景中的本地资源
-			print("将实例转换为本地资源")
+			print("Converting instance to local resource")
 			scene_instance.owner = edited_scene_root
 			
 			# 将动画和材质等资源转为本地
 			_make_resources_local(scene_instance)
 		else:
-			print("资源不是PackedScene类型，无法实例化")
+			print("Resource is not PackedScene type, cannot instantiate")
 			container.queue_free()
 			return
 	else:
-		print("导入FBX失败: 无法加载资源 (达到最大重试次数). 请确保FBX导入器已正确设置或文件有效.")
+		print("FBX import failed: Could not load resource (max retries reached). Please ensure FBX importer is correctly set up or the file is valid.")
 		container.queue_free()
 		return
 	
@@ -481,7 +481,7 @@ func _import_fbx(file_path, name):
 	# 标记场景为已修改，以便保存
 	edited_scene_root.set_meta("__editor_changed", true)
 	
-	print("导入FBX成功: ", file_path)
+	print("FBX import successful: ", file_path)
 
 # 将节点及其子节点中的所有资源转为本地资源
 func _make_resources_local(node):
@@ -507,7 +507,7 @@ func _make_animations_local(anim_player):
 			var local_animation = animation.duplicate()
 			anim_player.remove_animation(anim_name)
 			anim_player.add_animation(anim_name, local_animation)
-			print("动画已转为本地: ", anim_name)
+			print("Animation converted to local: ", anim_name)
 
 # 将网格实例中的网格和材质转为本地资源
 func _make_mesh_local(mesh_instance):
@@ -526,7 +526,7 @@ func _make_mesh_local(mesh_instance):
 				var local_material = material.duplicate()
 				local_mesh.surface_set_material(i, local_material)
 		
-		print("网格和材质已转为本地")
+		print("Mesh and materials converted to local")
 
 # 递归设置所有节点的所有权
 func _recursive_set_owner(node, owner):
@@ -542,18 +542,18 @@ func _count_children(node):
 	return count
 
 func _import_zip(file_path, name):
-	print("开始处理ZIP文件: ", file_path, " 名称: ", name)
+	print("Starting ZIP file processing: ", file_path, " name: ", name)
 	
 	var zip_reader = ZIPReader.new()
 	var err = zip_reader.open(file_path)
 	
 	if err != OK:
-		print("错误: 无法打开ZIP文件: ", err)
+		print("ERROR: Cannot open ZIP file: ", err)
 		return
 
 	var files_in_zip = zip_reader.get_files()
 	if files_in_zip.is_empty():
-		print("警告: ZIP文件为空.")
+		print("WARNING: ZIP file is empty.")
 		zip_reader.close()
 		return
 
@@ -564,17 +564,17 @@ func _import_zip(file_path, name):
 	
 	var dir_access = DirAccess.open("res://")
 	if not dir_access:
-		print("错误: 无法访问资源目录")
+		print("ERROR: Cannot access resource directory")
 		zip_reader.close()
 		return
 		
 	err = dir_access.make_dir_recursive(extract_path)
 	if err != OK:
-		print("错误: 无法创建解压目录: ", extract_path, " 错误码: ", err)
+		print("ERROR: Cannot create extraction directory: ", extract_path, " error code: ", err)
 		zip_reader.close()
 		return
 
-	print("解压到目录: ", extract_path)
+	print("Extracting to directory: ", extract_path)
 
 	var fbx_found = false
 	var extracted_fbx_path = ""
@@ -589,7 +589,7 @@ func _import_zip(file_path, name):
 		if not DirAccess.dir_exists_absolute(target_dir):
 			err = dir_access.make_dir_recursive(target_dir)
 			if err != OK:
-				print("警告: 无法创建子目录: ", target_dir, " 文件: ", file_in_zip)
+				print("WARNING: Cannot create subdirectory: ", target_dir, " file: ", file_in_zip)
 				continue # 跳过这个文件
 
 		# 写入文件
@@ -597,47 +597,43 @@ func _import_zip(file_path, name):
 		if file_access:
 			file_access.store_buffer(file_data)
 			file_access.close()
-			print("已解压: ", target_file_path)
+			print("Extracted: ", target_file_path)
 			
 			# 检查是否是FBX文件
 			if file_in_zip.get_extension().to_lower() == "fbx":
 				fbx_found = true
 				extracted_fbx_path = target_file_path
 		else:
-			print("错误: 无法写入解压文件: ", target_file_path)
+			print("ERROR: Cannot write extracted file: ", target_file_path)
 
 	zip_reader.close()
-	print("ZIP文件解压完成: ", extract_path)
+	print("ZIP file extraction complete: ", extract_path)
 	
 	# 手动触发文件系统扫描以确保编辑器识别新文件
 	if editor_interface:
-		print("正在刷新文件系统...")
+		print("Refreshing file system...")
 		var filesystem = editor_interface.get_resource_filesystem()
 		if filesystem:
 			filesystem.scan()
-			print("文件系统扫描已触发.")
+			print("File system scan triggered.")
 		else:
-			print("警告: 无法获取文件系统接口.")
+			print("WARNING: Could not get file system interface.")
 	else:
-		print("警告: editor_interface 为 null，无法触发文件系统扫描.")
+		print("WARNING: editor_interface is null, cannot trigger file system scan.")
 
 	# 如果在ZIP中找到FBX文件，则导入它
 	if fbx_found:
-		print("在ZIP中找到FBX文件，开始导入: ", extracted_fbx_path)
-		# 从extracted_fbx_path提取json_payload信息 (仅提取name)
-		var fbx_name = extracted_fbx_path.get_file().get_basename()
-		var fbx_json_payload = {
-			"name": fbx_name
-		}
-		_import_fbx(extracted_fbx_path, fbx_json_payload.name)
+		print("FBX file found in ZIP, starting import: ", extracted_fbx_path)
+		# 调用 _wait_for_file_recognition 等待FBX文件被识别
+		_wait_for_file_recognition(extracted_fbx_path)
 	else:
-		print("警告: ZIP文件中未找到FBX模型. 跳过模型导入.")
+		print("WARNING: No FBX model found in ZIP. Skipping model import.")
 	
 	# 删除原始的（可能错误命名的）ZIP文件
 	var remove_err = DirAccess.remove_absolute(file_path)
 	if remove_err == OK:
-		print("已成功删除原始ZIP文件: ", file_path)
+		print("Successfully deleted original ZIP file: ", file_path)
 	else:
-		print("错误: 删除原始ZIP文件失败: ", file_path, " 错误码: ", remove_err)
+		print("ERROR: Failed to delete original ZIP file: ", file_path, " error code: ", remove_err)
 
 	
