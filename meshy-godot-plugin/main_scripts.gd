@@ -10,7 +10,7 @@ var editor_interface: EditorInterface
 func _ready():
 	tcp_server = TCPServer.new()
 	
-	# Check if editor_interface is initialized
+	# 检查editor_interface是否已初始化
 	print("_ready: editor_interface initialization status: ", editor_interface != null)
 
 	# update status label
@@ -35,6 +35,47 @@ func _update_status_label():
 	var bridge_button = $VBoxContainer/Bridge
 	if bridge_button:
 		bridge_button.text = "Stop Meshy Bridge" if bridge_running else "Run Meshy Bridge"
+
+# 创建一个新的3D场景
+func _create_new_3d_scene() -> Node3D:
+	if not editor_interface:
+		return null
+	
+	# 创建新的3D根节点
+	var root = Node3D.new()
+	root.name = "MeshyScene"
+	
+	# 使用编辑器接口创建新场景
+	# 首先需要将根节点包装成PackedScene并保存
+	var packed_scene = PackedScene.new()
+	packed_scene.pack(root)
+	
+	# 生成唯一的场景文件路径
+	var scene_path = "res://imported_models/meshy_scene_%d.tscn" % Time.get_unix_time_from_system()
+	
+	# 确保目录存在
+	var dir = DirAccess.open("res://")
+	if not dir.dir_exists("res://imported_models"):
+		dir.make_dir("res://imported_models")
+	
+	# 保存场景
+	var error = ResourceSaver.save(packed_scene, scene_path)
+	if error != OK:
+		print("ERROR: Cannot save new scene: ", error)
+		root.queue_free()
+		return null
+	
+	# 在编辑器中打开这个场景
+	editor_interface.open_scene_from_path(scene_path)
+	
+	# 获取编辑后的场景根节点
+	var edited_root = editor_interface.get_edited_scene_root()
+	if edited_root:
+		print("New 3D scene created and opened: ", scene_path)
+		return edited_root
+	else:
+		print("ERROR: Failed to get edited scene root after opening")
+		return null
 
 func _on_open_meshy_pressed() -> void:
 	OS.shell_open("https://www.meshy.ai/")
@@ -200,69 +241,116 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 		
 		# ensure file exists and is accessible
 		if FileAccess.file_exists(file_path):
-			# manually trigger file system scan
-			if editor_interface:
-				var filesystem = editor_interface.get_resource_filesystem()
-				filesystem.scan()
+			# 不手动调用 filesystem.scan()，因为 Godot 会自动检测新文件
+			# 手动扫描会导致与自动导入冲突，产生 "Task 'reimport' already exists" 错误
+			# 只需等待 Godot 自动识别文件即可
+			print("File saved, waiting for Godot to recognize it...")
 			
-			# Use non-await method to wait for file recognition
+			# 使用定时器等待文件识别
 			_wait_for_file_recognition(file_path)
 		else:
 			print("ERROR: file not found: ", file_path)
 	else:
 		print("ERROR: cannot save file: ", file_path)
 
-# Modified _wait_for_file_recognition function to use Timer and signals instead of await
+# 存储待导入的文件路径和重试信息
+var _pending_import_path: String = ""
+var _pending_import_retries: int = 0
+const IMPORT_MAX_RETRIES: int = 30  # 使用常量避免脚本重载时被重置
+const SCAN_TRIGGER_ATTEMPT: int = 15  # 触发手动扫描的尝试次数（给Godot更多时间自动处理）
+var _import_check_timer: Timer = null
+var _scan_triggered: bool = false
+
+# 修改_wait_for_file_recognition函数，使用Timer而不是await（避免脚本重载问题）
 func _wait_for_file_recognition(file_path: String) -> void:
 	print("Waiting for file recognition: ", file_path)
 	
-	# If file already exists, continue directly
-	if ResourceLoader.exists(file_path):
-		print("File recognized: ", file_path)
-		_continue_import(file_path)
+	# 存储待导入的文件路径
+	_pending_import_path = file_path
+	_pending_import_retries = 0
+	_scan_triggered = false
+	
+	# 如果已有定时器在运行，先停止
+	if _import_check_timer and is_instance_valid(_import_check_timer):
+		_import_check_timer.stop()
+		_import_check_timer.queue_free()
+	
+	# 创建定时器
+	_import_check_timer = Timer.new()
+	_import_check_timer.wait_time = 0.3
+	_import_check_timer.one_shot = false
+	add_child(_import_check_timer)
+	
+	# 连接超时信号
+	_import_check_timer.timeout.connect(_on_import_check_timeout)
+	
+	# 启动定时器
+	_import_check_timer.start()
+
+func _on_import_check_timeout() -> void:
+	if _pending_import_path.is_empty():
+		if _import_check_timer:
+			_import_check_timer.stop()
+			_import_check_timer.queue_free()
+			_import_check_timer = null
 		return
 		
-	# Create timer
-	var timer = Timer.new()
-	timer.wait_time = 0.2
-	timer.one_shot = false
-	add_child(timer)
+	_pending_import_retries += 1
+	print("Waiting for file recognition... Attempts: ", _pending_import_retries)
 	
-	# Set counter
-	var retry_count = 0
-	var max_retries = 10
-	
-	# Connect timeout signal
-	timer.timeout.connect(func():
-		retry_count += 1
-		print("Waiting for file recognition... Attempts: ", retry_count)
+	# 检查文件是否已被识别
+	if ResourceLoader.exists(_pending_import_path):
+		print("File recognized: ", _pending_import_path)
+		var path_to_import = _pending_import_path
+		_pending_import_path = ""
 		
-		if ResourceLoader.exists(file_path):
-			print("File recognized: ", file_path)
-			timer.queue_free()
-			_continue_import(file_path)
-			return
-			
-		if retry_count >= max_retries:
-			print("File recognition timeout!")
-			timer.queue_free()
-	)
+		if _import_check_timer:
+			_import_check_timer.stop()
+			_import_check_timer.queue_free()
+			_import_check_timer = null
+		
+		# 延迟调用以确保文件系统完全就绪
+		call_deferred("_continue_import", path_to_import)
+		return
 	
-	# Start timer
-	timer.start()
+	# 在尝试指定次数后手动触发文件系统扫描（给自动检测一些时间）
+	if _pending_import_retries >= SCAN_TRIGGER_ATTEMPT and not _scan_triggered:
+		if editor_interface:
+			var filesystem = editor_interface.get_resource_filesystem()
+			# 只有在文件系统没有正在扫描时才触发手动扫描
+			if filesystem and not filesystem.is_scanning():
+				print("File not recognized yet, triggering manual scan...")
+				_scan_triggered = true
+				filesystem.scan()
+			else:
+				print("File system is busy, waiting...")
+		return
+		
+	if _pending_import_retries >= IMPORT_MAX_RETRIES:
+		print("File recognition timeout! Attempting to import anyway...")
+		var path_to_import = _pending_import_path
+		_pending_import_path = ""
+		
+		if _import_check_timer:
+			_import_check_timer.stop()
+			_import_check_timer.queue_free()
+			_import_check_timer = null
+		
+		# 即使超时也尝试导入（会使用 GLTFDocument 后备方案）
+		call_deferred("_continue_import", path_to_import)
 
-# Add new function to continue import process
+# 添加新函数，继续导入过程
 func _continue_import(file_path: String) -> void:
-	# Extract json_payload information from file_path (only extract name)
-	# var format = file_path.get_extension() # No longer rely on extension
+	# 从file_path提取json_payload信息 (仅提取name)
+	# var format = file_path.get_extension() # 不再依赖扩展名
 	var name = file_path.get_file().get_basename()
 	
 	var json_payload = {
-		# "format": format, # Format will be detected in _import_model
+		# "format": format, # 格式将在_import_model中检测
 		"name": name
 	}
 	
-	# Import model
+	# 导入模型
 	_import_model(file_path, json_payload)
 
 func _import_model(file_path, json_payload):
@@ -273,9 +361,9 @@ func _import_model(file_path, json_payload):
 		print("ERROR: Cannot open file for type detection: ", file_path)
 		return
 		
-	# Read file header magic number (read more bytes to detect FBX)
+	# 读取文件头部的魔数 (读取更多字节以检测FBX)
 	var magic_bytes = file.get_buffer(21) # FBX magic number is 21 bytes long
-	file.close() # Close file after detection
+	file.close() # 检测后关闭文件
 	
 	var detected_format = ""
 	
@@ -287,10 +375,10 @@ func _import_model(file_path, json_payload):
 	
 	if detected_format.is_empty(): # Only check for GLB and ZIP if FBX isn't detected
 		if magic_bytes.size() >= 4:
-			# Check GLB magic number "glTF" (0x676C5446)
+			# 检查GLB魔数 "glTF" (0x676C5446)
 			if magic_bytes[0] == 0x67 and magic_bytes[1] == 0x6C and magic_bytes[2] == 0x54 and magic_bytes[3] == 0x46:
 				detected_format = "glb"
-			# Check ZIP magic number "PK" (0x504B) - only need first two bytes
+			# 检查ZIP魔数 "PK" (0x504B) - 只需要前两个字节
 			elif magic_bytes[0] == 0x50 and magic_bytes[1] == 0x4B:
 				detected_format = "zip"
 			
@@ -300,9 +388,9 @@ func _import_model(file_path, json_payload):
 
 	print("Detected file format: ", detected_format)
 	
-	# Process using detected format
+	# 使用检测到的格式进行处理
 	match detected_format:
-		"glb", "gltf": # Still handle gltf just in case, even though magic number is glb
+		"glb", "gltf": # 仍然处理 gltf 以防万一，尽管魔数是 glb
 			_import_gltf(file_path, json_payload.name)
 		"fbx":
 			_import_fbx(file_path, json_payload.name)
@@ -314,51 +402,54 @@ func _import_model(file_path, json_payload):
 func _import_gltf(file_path, name):
 	print("Starting GLTF/GLB import")
 	
-	# Check editor interface
+	# 检查编辑器接口
 	if not editor_interface:
 		print("ERROR: editor_interface is null")
 		return
 		
-	# Check scene root
+	# 检查场景根，如果没有打开的场景则创建一个新场景
 	var edited_scene_root = editor_interface.get_edited_scene_root()
 	if not edited_scene_root:
-		print("ERROR: No open scene")
-		return
+		print("No open scene, creating a new 3D scene...")
+		edited_scene_root = _create_new_3d_scene()
+		if not edited_scene_root:
+			print("ERROR: Failed to create new scene")
+			return
 		
 	print("Scene root node: ", edited_scene_root.name)
 	
-	# Create container node
+	# 创建容器节点
 	var container = Node3D.new()
 	container.name = "Meshy_" + (name if name else "Model")
 	
-	# Add to current scene
+	# 添加到当前场景
 	edited_scene_root.add_child(container)
 	container.owner = edited_scene_root
 	
-	# Use ResourceLoader to load scene
+	# 使用ResourceLoader加载场景
 	print("Loading model: ", file_path)
 	var resource = ResourceLoader.load(file_path, "", ResourceLoader.CACHE_MODE_REUSE)
 	
 	if resource:
 		print("Resource loaded successfully: ", resource.get_class())
 		
-		# Process based on resource type
+		# 根据资源类型进行处理
 		if resource is PackedScene:
-			# Instantiate scene
+			# 实例化场景
 			var scene_instance = resource.instantiate()
 			print("Scene instantiated successfully: ", scene_instance.get_class())
 			
-			# Add to container
+			# 添加到容器
 			container.add_child(scene_instance)
 			
-			# Recursively set ownership of all nodes to scene root
+			# 递归设置所有节点的所有权为场景根
 			_recursive_set_owner(scene_instance, edited_scene_root)
 			
-			# Save instance as local resource in scene
+			# 将实例保存为场景中的本地资源
 			print("Converting instance to local resource")
 			scene_instance.owner = edited_scene_root
 			
-			# Convert animations and materials to local resources
+			# 将动画和材质等资源转为本地
 			_make_resources_local(scene_instance)
 		else:
 			print("Resource is not PackedScene type, cannot instantiate")
@@ -374,13 +465,13 @@ func _import_gltf(file_path, name):
 		if error == OK:
 			var scene = gltf.generate_scene(state)
 			if scene:
-				# Add to container
+				# 添加到容器
 				container.add_child(scene)
 				
-				# Set ownership
+				# 设置所有权
 				_recursive_set_owner(scene, edited_scene_root)
 				
-				# Convert animations and materials to local resources
+				# 将动画和材质等资源转为本地
 				_make_resources_local(scene)
 				
 				print("GLTFDocument import successful")
@@ -393,11 +484,11 @@ func _import_gltf(file_path, name):
 			container.queue_free()
 			return
 	
-	# Notify editor to refresh and select new node
+	# 通知编辑器刷新和选择新节点
 	editor_interface.get_selection().clear()
 	editor_interface.get_selection().add_node(container)
 	
-	# Mark scene as modified for saving
+	# 标记场景为已修改，以便保存
 	edited_scene_root.set_meta("__editor_changed", true)
 	
 	print("GLTF/GLB import successful: ", file_path)
@@ -405,28 +496,31 @@ func _import_gltf(file_path, name):
 func _import_fbx(file_path, name):
 	print("Starting FBX import")
 	
-	# Check editor interface
+	# 检查编辑器接口
 	if not editor_interface:
 		print("ERROR: editor_interface is null")
 		return
 		
-	# Check scene root
+	# 检查场景根，如果没有打开的场景则创建一个新场景
 	var edited_scene_root = editor_interface.get_edited_scene_root()
 	if not edited_scene_root:
-		print("ERROR: No open scene")
-		return
+		print("No open scene, creating a new 3D scene...")
+		edited_scene_root = _create_new_3d_scene()
+		if not edited_scene_root:
+			print("ERROR: Failed to create new scene")
+			return
 		
 	print("Scene root node: ", edited_scene_root.name)
 	
-	# Create container node
+	# 创建容器节点
 	var container = Node3D.new()
 	container.name = "Meshy_" + (name if name else "Model")
 	
-	# Add to current scene
+	# 添加到当前场景
 	edited_scene_root.add_child(container)
 	container.owner = edited_scene_root
 	
-	# Use ResourceLoader to load scene
+	# 使用ResourceLoader加载场景
 	print("Loading model: ", file_path)
 	# Godot 4.x has native FBX import support
 	
@@ -447,23 +541,23 @@ func _import_fbx(file_path, name):
 		await get_tree().create_timer(retry_delay).timeout # Wait before retrying
 		
 	if resource:
-		# Process based on resource type
+		# 根据资源类型进行处理
 		if resource is PackedScene:
-			# Instantiate scene
+			# 实例化场景
 			var scene_instance = resource.instantiate()
 			print("Scene instantiated successfully: ", scene_instance.get_class())
 			
-			# Add to container
+			# 添加到容器
 			container.add_child(scene_instance)
 			
-			# Recursively set ownership of all nodes to scene root
+			# 递归设置所有节点的所有权为场景根
 			_recursive_set_owner(scene_instance, edited_scene_root)
 			
-			# Save instance as local resource in scene
+			# 将实例保存为场景中的本地资源
 			print("Converting instance to local resource")
 			scene_instance.owner = edited_scene_root
 			
-			# Convert animations and materials to local resources
+			# 将动画和材质等资源转为本地
 			_make_resources_local(scene_instance)
 		else:
 			print("Resource is not PackedScene type, cannot instantiate")
@@ -474,67 +568,83 @@ func _import_fbx(file_path, name):
 		container.queue_free()
 		return
 	
-	# Notify editor to refresh and select new node
+	# 通知编辑器刷新和选择新节点
 	editor_interface.get_selection().clear()
 	editor_interface.get_selection().add_node(container)
 	
-	# Mark scene as modified for saving
+	# 标记场景为已修改，以便保存
 	edited_scene_root.set_meta("__editor_changed", true)
 	
 	print("FBX import successful: ", file_path)
 
-# Convert all resources in node and its children to local resources
+# 将节点及其子节点中的所有资源转为本地资源
 func _make_resources_local(node):
-	# Check and process animation player
+	# 检查并处理动画播放器
 	if node is AnimationPlayer:
 		_make_animations_local(node)
 	
-	# Process mesh instance
+	# 处理网格实例
 	if node is MeshInstance3D:
 		_make_mesh_local(node)
 	
-	# Recursively process all child nodes
+	# 递归处理所有子节点
 	for child in node.get_children():
 		_make_resources_local(child)
 
-# Convert animations in animation player to local resources
-func _make_animations_local(anim_player):
-	var animation_names = anim_player.get_animation_list()
-	for anim_name in animation_names:
-		var animation = anim_player.get_animation(anim_name)
-		if animation:
-			# Create a copy of the animation and replace the original
-			var local_animation = animation.duplicate()
-			anim_player.remove_animation(anim_name)
-			anim_player.add_animation(anim_name, local_animation)
-			print("Animation converted to local: ", anim_name)
+# 将动画播放器中的动画转为本地资源
+func _make_animations_local(anim_player: AnimationPlayer):
+	# Godot 4.x 使用 AnimationLibrary 管理动画
+	var library_names = anim_player.get_animation_library_list()
+	
+	for lib_name in library_names:
+		var library = anim_player.get_animation_library(lib_name)
+		if not library:
+			continue
+			
+		# 制作库的副本
+		var local_library = AnimationLibrary.new()
+		var animation_names = library.get_animation_list()
+		
+		for anim_name in animation_names:
+			var animation = library.get_animation(anim_name)
+			if animation:
+				# 制作动画的副本
+				var local_animation = animation.duplicate()
+				local_library.add_animation(anim_name, local_animation)
+				print("Animation converted to local: ", lib_name + "/" + anim_name if lib_name else anim_name)
+		
+		# 移除旧库并添加新的本地库
+		anim_player.remove_animation_library(lib_name)
+		anim_player.add_animation_library(lib_name, local_library)
+	
+	print("All animations converted to local")
 
-# Convert mesh and materials in mesh instance to local resources
+# 将网格实例中的网格和材质转为本地资源
 func _make_mesh_local(mesh_instance):
 	var mesh = mesh_instance.mesh
 	if mesh:
-		# Create a copy of the mesh
+		# 制作网格的副本
 		var local_mesh = mesh.duplicate()
 		mesh_instance.mesh = local_mesh
 		
-		# Process materials in the mesh
+		# 处理网格中的材质
 		var material_count = local_mesh.get_surface_count()
 		for i in range(material_count):
 			var material = local_mesh.surface_get_material(i)
 			if material:
-				# Create a copy of the material
+				# 制作材质的副本
 				var local_material = material.duplicate()
 				local_mesh.surface_set_material(i, local_material)
 		
 		print("Mesh and materials converted to local")
 
-# Recursively set ownership of all nodes
+# 递归设置所有节点的所有权
 func _recursive_set_owner(node, owner):
 	for child in node.get_children():
 		child.owner = owner
 		_recursive_set_owner(child, owner)
 
-# Helper function to count child nodes
+# 计算子节点数量的辅助函数
 func _count_children(node):
 	var count = 0
 	for child in node.get_children():
@@ -557,7 +667,7 @@ func _import_zip(file_path, name):
 		zip_reader.close()
 		return
 
-	# Create extraction target directory
+	# 创建解压目标目录
 	var base_extract_dir = "res://imported_models"
 	var extract_dir_name = "extracted_%s_%d" % [name, Time.get_unix_time_from_system()]
 	var extract_path = base_extract_dir.path_join(extract_dir_name)
@@ -579,27 +689,27 @@ func _import_zip(file_path, name):
 	var fbx_found = false
 	var extracted_fbx_path = ""
 
-	# Extract files
+	# 提取文件
 	for file_in_zip in files_in_zip:
 		var file_data = zip_reader.read_file(file_in_zip)
 		var target_file_path = extract_path.path_join(file_in_zip)
 		
-		# Ensure parent directory of target file exists (handle directory structure in ZIP)
+		# 确保目标文件的父目录存在 (处理ZIP内的目录结构)
 		var target_dir = target_file_path.get_base_dir()
 		if not DirAccess.dir_exists_absolute(target_dir):
 			err = dir_access.make_dir_recursive(target_dir)
 			if err != OK:
 				print("WARNING: Cannot create subdirectory: ", target_dir, " file: ", file_in_zip)
-				continue # Skip this file
+				continue # 跳过这个文件
 
-		# Write file
+		# 写入文件
 		var file_access = FileAccess.open(target_file_path, FileAccess.WRITE)
 		if file_access:
 			file_access.store_buffer(file_data)
 			file_access.close()
 			print("Extracted: ", target_file_path)
 			
-			# Check if it's an FBX file
+			# 检查是否是FBX文件
 			if file_in_zip.get_extension().to_lower() == "fbx":
 				fbx_found = true
 				extracted_fbx_path = target_file_path
@@ -609,27 +719,19 @@ func _import_zip(file_path, name):
 	zip_reader.close()
 	print("ZIP file extraction complete: ", extract_path)
 	
-	# Manually trigger file system scan to ensure editor recognizes new files
-	if editor_interface:
-		print("Refreshing file system...")
-		var filesystem = editor_interface.get_resource_filesystem()
-		if filesystem:
-			filesystem.scan()
-			print("File system scan triggered.")
-		else:
-			print("WARNING: Could not get file system interface.")
-	else:
-		print("WARNING: editor_interface is null, cannot trigger file system scan.")
+	# 不手动调用 filesystem.scan()，让 Godot 自动检测新文件
+	# 这样可以避免与自动导入冲突产生的 "Task 'reimport' already exists" 错误
+	print("ZIP extraction complete, waiting for Godot to recognize files...")
 
-	# If FBX file found in ZIP, import it
+	# 如果在ZIP中找到FBX文件，则导入它
 	if fbx_found:
 		print("FBX file found in ZIP, starting import: ", extracted_fbx_path)
-		# Call _wait_for_file_recognition to wait for FBX file to be recognized
+		# 调用 _wait_for_file_recognition 等待FBX文件被识别
 		_wait_for_file_recognition(extracted_fbx_path)
 	else:
 		print("WARNING: No FBX model found in ZIP. Skipping model import.")
 	
-	# Delete original (possibly incorrectly named) ZIP file
+	# 删除原始的（可能错误命名的）ZIP文件
 	var remove_err = DirAccess.remove_absolute(file_path)
 	if remove_err == OK:
 		print("Successfully deleted original ZIP file: ", file_path)
