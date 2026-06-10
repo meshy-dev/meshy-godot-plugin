@@ -245,7 +245,10 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 			# 手动扫描会导致与自动导入冲突，产生 "Task 'reimport' already exists" 错误
 			# 只需等待 Godot 自动识别文件即可
 			print("File saved, waiting for Godot to recognize it...")
-			
+
+			# 记下前端请求里的模型名,供 _continue_import 命名导入节点
+			_pending_import_name = json_payload.get("name", "")
+
 			# 使用定时器等待文件识别
 			_wait_for_file_recognition(file_path)
 		else:
@@ -255,6 +258,8 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 
 # 存储待导入的文件路径和重试信息
 var _pending_import_path: String = ""
+# 来自前端请求 body 的模型名(与其它 bridge 对齐:优先用请求 name,缺失时回退文件名)
+var _pending_import_name: String = ""
 var _pending_import_retries: int = 0
 const IMPORT_MAX_RETRIES: int = 30  # 使用常量避免脚本重载时被重置
 const SCAN_TRIGGER_ATTEMPT: int = 15  # 触发手动扫描的尝试次数（给Godot更多时间自动处理）
@@ -341,10 +346,10 @@ func _on_import_check_timeout() -> void:
 
 # 添加新函数，继续导入过程
 func _continue_import(file_path: String) -> void:
-	# 从file_path提取json_payload信息 (仅提取name)
-	# var format = file_path.get_extension() # 不再依赖扩展名
-	var name = file_path.get_file().get_basename()
-	
+	# 优先使用前端请求 body 里的 name(与 Unity/Blender/3dsMax/Maya 对齐),
+	# 为空时回退到从下载文件名推断
+	var name = _pending_import_name if _pending_import_name != "" else file_path.get_file().get_basename()
+
 	var json_payload = {
 		# "format": format, # 格式将在_import_model中检测
 		"name": name
