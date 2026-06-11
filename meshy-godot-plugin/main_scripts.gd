@@ -7,6 +7,14 @@ var peerTCP: StreamPeerTCP
 var server_port = 5325
 var editor_interface: EditorInterface
 
+# --- Download / import progress toast (bottom-right editor overlay) ---
+var _active_download: HTTPRequest = null
+var _progress_panel: PanelContainer = null
+var _progress_title: Label = null
+var _progress_detail: Label = null
+var _progress_bar: ProgressBar = null
+var _progress_hide_at_msec: int = 0
+
 func _ready():
 	tcp_server = TCPServer.new()
 	
@@ -24,6 +32,8 @@ func _process(_delta):
 	if peerTCP != null:
 		# https://docs.godotengine.org/en/stable/classes/class_streampeertcp.html#class-streampeertcp
 		_handle_peer_tcp()
+	# Keep the download/import progress toast in sync each frame.
+	_update_download_progress()
 
 
 func _update_status_label():
@@ -35,6 +45,110 @@ func _update_status_label():
 	var bridge_button = $VBoxContainer/Bridge
 	if bridge_button:
 		bridge_button.text = "Stop Meshy Bridge" if bridge_running else "Run Meshy Bridge"
+
+# --- Progress toast -----------------------------------------------------------
+# A small non-blocking overlay pinned to the editor's bottom-right corner, so the
+# user sees download/import progress on any main-screen tab (not just the Meshy
+# tab, and without watching the Output console).
+
+func _ensure_progress_ui() -> void:
+	if _progress_panel and is_instance_valid(_progress_panel):
+		return
+	if not editor_interface:
+		return
+	var base = editor_interface.get_base_control()
+	if not base:
+		return
+
+	_progress_panel = PanelContainer.new()
+	_progress_panel.name = "MeshyProgressToast"
+	_progress_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# Pin the panel's bottom-right corner 20px from the editor's bottom-right
+	# corner and let it grow up-left to fit its content, so text is never
+	# clipped regardless of the editor font scale / HiDPI. (A fixed-size rect
+	# was too small for the scaled font and overflowed.)
+	_progress_panel.anchor_left = 1.0
+	_progress_panel.anchor_top = 1.0
+	_progress_panel.anchor_right = 1.0
+	_progress_panel.anchor_bottom = 1.0
+	_progress_panel.offset_left = -20.0
+	_progress_panel.offset_top = -20.0
+	_progress_panel.offset_right = -20.0
+	_progress_panel.offset_bottom = -20.0
+	_progress_panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	_progress_panel.grow_vertical = Control.GROW_DIRECTION_BEGIN
+
+	var margin = MarginContainer.new()
+	margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	for side in ["left", "right", "top", "bottom"]:
+		margin.add_theme_constant_override("margin_" + side, 10)
+	_progress_panel.add_child(margin)
+
+	var vb = VBoxContainer.new()
+	vb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	margin.add_child(vb)
+
+	_progress_title = Label.new()
+	_progress_title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_progress_title.text = "Meshy"
+	vb.add_child(_progress_title)
+
+	_progress_detail = Label.new()
+	_progress_detail.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vb.add_child(_progress_detail)
+
+	_progress_bar = ProgressBar.new()
+	_progress_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_progress_bar.min_value = 0.0
+	_progress_bar.max_value = 100.0
+	_progress_bar.custom_minimum_size = Vector2(300, 0)
+	vb.add_child(_progress_bar)
+
+	base.add_child(_progress_panel)
+	_progress_panel.visible = false
+
+func _show_progress(title: String, detail: String, ratio: float) -> void:
+	_ensure_progress_ui()
+	if not _progress_panel:
+		return
+	_progress_panel.visible = true
+	_progress_title.text = title
+	_progress_detail.text = detail
+	if ratio < 0.0:
+		# Indeterminate phase (e.g. importing): hide the bar, keep the text.
+		_progress_bar.visible = false
+	else:
+		_progress_bar.visible = true
+		_progress_bar.value = clampf(ratio, 0.0, 1.0) * 100.0
+
+func _finish_progress(detail: String) -> void:
+	# Show a final line, then auto-hide the toast shortly after.
+	_show_progress("Meshy", detail, 1.0)
+	_progress_hide_at_msec = Time.get_ticks_msec() + 2500
+
+func _update_download_progress() -> void:
+	# Poll the active download's byte counts and reflect them in the toast.
+	if _active_download and is_instance_valid(_active_download):
+		var total = _active_download.get_body_size()
+		var got = _active_download.get_downloaded_bytes()
+		if total > 0:
+			var pct = float(got) / float(total)
+			_show_progress("Meshy · Downloading model",
+				"%d%%  (%.1f / %.1f MB)" % [int(pct * 100.0), got / 1048576.0, total / 1048576.0], pct)
+		else:
+			_show_progress("Meshy · Downloading model", "%.1f MB downloaded" % (got / 1048576.0), -1.0)
+	# Auto-hide once the finish timer elapses.
+	if _progress_hide_at_msec > 0 and Time.get_ticks_msec() >= _progress_hide_at_msec:
+		_progress_hide_at_msec = 0
+		if _progress_panel and is_instance_valid(_progress_panel):
+			_progress_panel.visible = false
+
+func _exit_tree() -> void:
+	# The toast is parented to the editor base control (not to us), so free it
+	# explicitly on unload to avoid leaving an orphan overlay behind.
+	if _progress_panel and is_instance_valid(_progress_panel):
+		_progress_panel.queue_free()
+		_progress_panel = null
 
 # 创建一个新的3D场景
 func _create_new_3d_scene() -> Node3D:
@@ -205,22 +319,35 @@ func _download_and_import_file(json_payload):
 	add_child(http)
 	# connect signal
 	http.connect("request_completed", _on_download_completed.bind(json_payload))
-	
+
+	# Track this request so _process can poll its byte counts for the toast.
+	_active_download = http
+	_show_progress("Meshy · Downloading model", "Starting…", 0.0)
+
 	# start download
 	var error = http.request(json_payload.url)
 	if error != OK:
 		print("ERROR: download request failed: ", error)
+		_active_download = null
+		_finish_progress("Download failed")
 		http.queue_free()
 
 func _on_download_completed(result, response_code, headers, body, json_payload):
 	print("Download completed: result=", result, " response_code=", response_code, " data_size=", body.size())
-	
+
+	# Stop polling the request for progress and release the node.
+	if _active_download and is_instance_valid(_active_download):
+		_active_download.queue_free()
+	_active_download = null
+
 	if result != HTTPRequest.RESULT_SUCCESS:
 		print("ERROR: download failed: ", result)
+		_finish_progress("Download failed")
 		return
-	
+
 	if response_code != 200:
 		print("ERROR: download response code error: ", response_code)
+		_finish_progress("Download failed (HTTP %d)" % response_code)
 		return
 	
 	# save to project resource directory
@@ -229,7 +356,9 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 	if not dir.dir_exists(res_dir):
 		dir.make_dir(res_dir)
 	
-	var file_name = "meshy_model_" + str(Time.get_unix_time_from_system()) + "." + json_payload.format
+	# int() so the filename gets a clean unix-second stamp; the raw float would
+	# leave a fractional part (meshy_model_1781147046.00945.glb).
+	var file_name = "meshy_model_" + str(int(Time.get_unix_time_from_system())) + "." + json_payload.format
 	var file_path = res_dir.path_join(file_name)
 	
 	var file = FileAccess.open(file_path, FileAccess.WRITE)
@@ -241,11 +370,16 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 		
 		# ensure file exists and is accessible
 		if FileAccess.file_exists(file_path):
-			# 不手动调用 filesystem.scan()，因为 Godot 会自动检测新文件
-			# 手动扫描会导致与自动导入冲突，产生 "Task 'reimport' already exists" 错误
-			# 只需等待 Godot 自动识别文件即可
+			# _wait_for_file_recognition triggers a single up-front filesystem
+			# scan and then polls until the import lands (with a GLTFDocument
+			# fallback on timeout).
 			print("File saved, waiting for Godot to recognize it...")
-			
+
+			# 记下前端请求里的模型名,供 _continue_import 命名导入节点
+			_pending_import_name = json_payload.get("name", "")
+
+			_show_progress("Meshy · Importing", "Processing model…", -1.0)
+
 			# 使用定时器等待文件识别
 			_wait_for_file_recognition(file_path)
 		else:
@@ -255,11 +389,11 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 
 # 存储待导入的文件路径和重试信息
 var _pending_import_path: String = ""
+# 来自前端请求 body 的模型名(与其它 bridge 对齐:优先用请求 name,缺失时回退文件名)
+var _pending_import_name: String = ""
 var _pending_import_retries: int = 0
 const IMPORT_MAX_RETRIES: int = 30  # 使用常量避免脚本重载时被重置
-const SCAN_TRIGGER_ATTEMPT: int = 15  # 触发手动扫描的尝试次数（给Godot更多时间自动处理）
 var _import_check_timer: Timer = null
-var _scan_triggered: bool = false
 
 # 修改_wait_for_file_recognition函数，使用Timer而不是await（避免脚本重载问题）
 func _wait_for_file_recognition(file_path: String) -> void:
@@ -268,8 +402,18 @@ func _wait_for_file_recognition(file_path: String) -> void:
 	# 存储待导入的文件路径
 	_pending_import_path = file_path
 	_pending_import_retries = 0
-	_scan_triggered = false
-	
+
+	# Trigger ONE filesystem scan up front so the editor imports the file we
+	# just wrote even while it is unfocused. Godot otherwise only rescans on
+	# focus, so ResourceLoader never sees the file and we fall back to the
+	# uncompressed GLTFDocument path. Scanning once, early, also lets the import
+	# finish before any later focus-scan, avoiding the duplicate
+	# "Task 'reimport' already exists" race.
+	if editor_interface:
+		var fs = editor_interface.get_resource_filesystem()
+		if fs and not fs.is_scanning():
+			fs.scan()
+
 	# 如果已有定时器在运行，先停止
 	if _import_check_timer and is_instance_valid(_import_check_timer):
 		_import_check_timer.stop()
@@ -313,18 +457,9 @@ func _on_import_check_timeout() -> void:
 		call_deferred("_continue_import", path_to_import)
 		return
 	
-	# 在尝试指定次数后手动触发文件系统扫描（给自动检测一些时间）
-	if _pending_import_retries >= SCAN_TRIGGER_ATTEMPT and not _scan_triggered:
-		if editor_interface:
-			var filesystem = editor_interface.get_resource_filesystem()
-			# 只有在文件系统没有正在扫描时才触发手动扫描
-			if filesystem and not filesystem.is_scanning():
-				print("File not recognized yet, triggering manual scan...")
-				_scan_triggered = true
-				filesystem.scan()
-			else:
-				print("File system is busy, waiting...")
-		return
+	# The up-front scan (in _wait_for_file_recognition) drives the import; here
+	# we only poll. If recognition never lands, the timeout below imports via
+	# GLTFDocument as a fallback.
 		
 	if _pending_import_retries >= IMPORT_MAX_RETRIES:
 		print("File recognition timeout! Attempting to import anyway...")
@@ -341,10 +476,10 @@ func _on_import_check_timeout() -> void:
 
 # 添加新函数，继续导入过程
 func _continue_import(file_path: String) -> void:
-	# 从file_path提取json_payload信息 (仅提取name)
-	# var format = file_path.get_extension() # 不再依赖扩展名
-	var name = file_path.get_file().get_basename()
-	
+	# 优先使用前端请求 body 里的 name(与 Unity/Blender/3dsMax/Maya 对齐),
+	# 为空时回退到从下载文件名推断
+	var name = _pending_import_name if _pending_import_name != "" else file_path.get_file().get_basename()
+
 	var json_payload = {
 		# "format": format, # 格式将在_import_model中检测
 		"name": name
@@ -352,6 +487,7 @@ func _continue_import(file_path: String) -> void:
 	
 	# 导入模型
 	_import_model(file_path, json_payload)
+	_finish_progress("Imported: " + name)
 
 func _import_model(file_path, json_payload):
 	print("Preparing to detect and import model: ", file_path)
