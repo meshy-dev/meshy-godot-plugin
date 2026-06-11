@@ -243,9 +243,9 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 		
 		# ensure file exists and is accessible
 		if FileAccess.file_exists(file_path):
-			# 不手动调用 filesystem.scan()，因为 Godot 会自动检测新文件
-			# 手动扫描会导致与自动导入冲突，产生 "Task 'reimport' already exists" 错误
-			# 只需等待 Godot 自动识别文件即可
+			# _wait_for_file_recognition triggers a single up-front filesystem
+			# scan and then polls until the import lands (with a GLTFDocument
+			# fallback on timeout).
 			print("File saved, waiting for Godot to recognize it...")
 
 			# 记下前端请求里的模型名,供 _continue_import 命名导入节点
@@ -273,7 +273,18 @@ func _wait_for_file_recognition(file_path: String) -> void:
 	# 存储待导入的文件路径
 	_pending_import_path = file_path
 	_pending_import_retries = 0
-	
+
+	# Trigger ONE filesystem scan up front so the editor imports the file we
+	# just wrote even while it is unfocused. Godot otherwise only rescans on
+	# focus, so ResourceLoader never sees the file and we fall back to the
+	# uncompressed GLTFDocument path. Scanning once, early, also lets the import
+	# finish before any later focus-scan, avoiding the duplicate
+	# "Task 'reimport' already exists" race.
+	if editor_interface:
+		var fs = editor_interface.get_resource_filesystem()
+		if fs and not fs.is_scanning():
+			fs.scan()
+
 	# 如果已有定时器在运行，先停止
 	if _import_check_timer and is_instance_valid(_import_check_timer):
 		_import_check_timer.stop()
@@ -317,11 +328,9 @@ func _on_import_check_timeout() -> void:
 		call_deferred("_continue_import", path_to_import)
 		return
 	
-	# Deliberately NO manual filesystem.scan() here: Godot's editor watcher
-	# already queues a reimport for the file we just wrote, and a manual scan
-	# races it ("Task 'reimport' already exists"). We just poll until the
-	# resource is recognized; the timeout below imports via GLTFDocument as a
-	# fallback if recognition never lands.
+	# The up-front scan (in _wait_for_file_recognition) drives the import; here
+	# we only poll. If recognition never lands, the timeout below imports via
+	# GLTFDocument as a fallback.
 		
 	if _pending_import_retries >= IMPORT_MAX_RETRIES:
 		print("File recognition timeout! Attempting to import anyway...")
