@@ -229,7 +229,9 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 	if not dir.dir_exists(res_dir):
 		dir.make_dir(res_dir)
 	
-	var file_name = "meshy_model_" + str(Time.get_unix_time_from_system()) + "." + json_payload.format
+	# int() so the filename gets a clean unix-second stamp; the raw float would
+	# leave a fractional part (meshy_model_1781147046.00945.glb).
+	var file_name = "meshy_model_" + str(int(Time.get_unix_time_from_system())) + "." + json_payload.format
 	var file_path = res_dir.path_join(file_name)
 	
 	var file = FileAccess.open(file_path, FileAccess.WRITE)
@@ -262,9 +264,7 @@ var _pending_import_path: String = ""
 var _pending_import_name: String = ""
 var _pending_import_retries: int = 0
 const IMPORT_MAX_RETRIES: int = 30  # 使用常量避免脚本重载时被重置
-const SCAN_TRIGGER_ATTEMPT: int = 15  # 触发手动扫描的尝试次数（给Godot更多时间自动处理）
 var _import_check_timer: Timer = null
-var _scan_triggered: bool = false
 
 # 修改_wait_for_file_recognition函数，使用Timer而不是await（避免脚本重载问题）
 func _wait_for_file_recognition(file_path: String) -> void:
@@ -273,7 +273,6 @@ func _wait_for_file_recognition(file_path: String) -> void:
 	# 存储待导入的文件路径
 	_pending_import_path = file_path
 	_pending_import_retries = 0
-	_scan_triggered = false
 	
 	# 如果已有定时器在运行，先停止
 	if _import_check_timer and is_instance_valid(_import_check_timer):
@@ -318,18 +317,11 @@ func _on_import_check_timeout() -> void:
 		call_deferred("_continue_import", path_to_import)
 		return
 	
-	# 在尝试指定次数后手动触发文件系统扫描（给自动检测一些时间）
-	if _pending_import_retries >= SCAN_TRIGGER_ATTEMPT and not _scan_triggered:
-		if editor_interface:
-			var filesystem = editor_interface.get_resource_filesystem()
-			# 只有在文件系统没有正在扫描时才触发手动扫描
-			if filesystem and not filesystem.is_scanning():
-				print("File not recognized yet, triggering manual scan...")
-				_scan_triggered = true
-				filesystem.scan()
-			else:
-				print("File system is busy, waiting...")
-		return
+	# Deliberately NO manual filesystem.scan() here: Godot's editor watcher
+	# already queues a reimport for the file we just wrote, and a manual scan
+	# races it ("Task 'reimport' already exists"). We just poll until the
+	# resource is recognized; the timeout below imports via GLTFDocument as a
+	# fallback if recognition never lands.
 		
 	if _pending_import_retries >= IMPORT_MAX_RETRIES:
 		print("File recognition timeout! Attempting to import anyway...")
