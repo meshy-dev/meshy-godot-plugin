@@ -7,6 +7,14 @@ var peerTCP: StreamPeerTCP
 var server_port = 5325
 var editor_interface: EditorInterface
 
+# --- Download / import progress toast (bottom-right editor overlay) ---
+var _active_download: HTTPRequest = null
+var _progress_panel: PanelContainer = null
+var _progress_title: Label = null
+var _progress_detail: Label = null
+var _progress_bar: ProgressBar = null
+var _progress_hide_at_msec: int = 0
+
 func _ready():
 	tcp_server = TCPServer.new()
 	
@@ -24,6 +32,8 @@ func _process(_delta):
 	if peerTCP != null:
 		# https://docs.godotengine.org/en/stable/classes/class_streampeertcp.html#class-streampeertcp
 		_handle_peer_tcp()
+	# Keep the download/import progress toast in sync each frame.
+	_update_download_progress()
 
 
 func _update_status_label():
@@ -35,6 +45,105 @@ func _update_status_label():
 	var bridge_button = $VBoxContainer/Bridge
 	if bridge_button:
 		bridge_button.text = "Stop Meshy Bridge" if bridge_running else "Run Meshy Bridge"
+
+# --- Progress toast -----------------------------------------------------------
+# A small non-blocking overlay pinned to the editor's bottom-right corner, so the
+# user sees download/import progress on any main-screen tab (not just the Meshy
+# tab, and without watching the Output console).
+
+func _ensure_progress_ui() -> void:
+	if _progress_panel and is_instance_valid(_progress_panel):
+		return
+	if not editor_interface:
+		return
+	var base = editor_interface.get_base_control()
+	if not base:
+		return
+
+	_progress_panel = PanelContainer.new()
+	_progress_panel.name = "MeshyProgressToast"
+	_progress_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# Pin to the bottom-right corner, 20px inset, ~320x100.
+	_progress_panel.anchor_left = 1.0
+	_progress_panel.anchor_top = 1.0
+	_progress_panel.anchor_right = 1.0
+	_progress_panel.anchor_bottom = 1.0
+	_progress_panel.offset_left = -340.0
+	_progress_panel.offset_top = -120.0
+	_progress_panel.offset_right = -20.0
+	_progress_panel.offset_bottom = -20.0
+
+	var margin = MarginContainer.new()
+	margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	for side in ["left", "right", "top", "bottom"]:
+		margin.add_theme_constant_override("margin_" + side, 10)
+	_progress_panel.add_child(margin)
+
+	var vb = VBoxContainer.new()
+	vb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	margin.add_child(vb)
+
+	_progress_title = Label.new()
+	_progress_title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_progress_title.text = "Meshy"
+	vb.add_child(_progress_title)
+
+	_progress_detail = Label.new()
+	_progress_detail.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vb.add_child(_progress_detail)
+
+	_progress_bar = ProgressBar.new()
+	_progress_bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_progress_bar.min_value = 0.0
+	_progress_bar.max_value = 100.0
+	_progress_bar.custom_minimum_size = Vector2(300, 0)
+	vb.add_child(_progress_bar)
+
+	base.add_child(_progress_panel)
+	_progress_panel.visible = false
+
+func _show_progress(title: String, detail: String, ratio: float) -> void:
+	_ensure_progress_ui()
+	if not _progress_panel:
+		return
+	_progress_panel.visible = true
+	_progress_title.text = title
+	_progress_detail.text = detail
+	if ratio < 0.0:
+		# Indeterminate phase (e.g. importing): hide the bar, keep the text.
+		_progress_bar.visible = false
+	else:
+		_progress_bar.visible = true
+		_progress_bar.value = clampf(ratio, 0.0, 1.0) * 100.0
+
+func _finish_progress(detail: String) -> void:
+	# Show a final line, then auto-hide the toast shortly after.
+	_show_progress("Meshy", detail, 1.0)
+	_progress_hide_at_msec = Time.get_ticks_msec() + 2500
+
+func _update_download_progress() -> void:
+	# Poll the active download's byte counts and reflect them in the toast.
+	if _active_download and is_instance_valid(_active_download):
+		var total = _active_download.get_body_size()
+		var got = _active_download.get_downloaded_bytes()
+		if total > 0:
+			var pct = float(got) / float(total)
+			_show_progress("Meshy · Downloading model",
+				"%d%%  (%.1f / %.1f MB)" % [int(pct * 100.0), got / 1048576.0, total / 1048576.0], pct)
+		else:
+			_show_progress("Meshy · Downloading model", "%.1f MB downloaded" % (got / 1048576.0), -1.0)
+	# Auto-hide once the finish timer elapses.
+	if _progress_hide_at_msec > 0 and Time.get_ticks_msec() >= _progress_hide_at_msec:
+		_progress_hide_at_msec = 0
+		if _progress_panel and is_instance_valid(_progress_panel):
+			_progress_panel.visible = false
+
+func _exit_tree() -> void:
+	# The toast is parented to the editor base control (not to us), so free it
+	# explicitly on unload to avoid leaving an orphan overlay behind.
+	if _progress_panel and is_instance_valid(_progress_panel):
+		_progress_panel.queue_free()
+		_progress_panel = null
 
 # 创建一个新的3D场景
 func _create_new_3d_scene() -> Node3D:
@@ -205,22 +314,35 @@ func _download_and_import_file(json_payload):
 	add_child(http)
 	# connect signal
 	http.connect("request_completed", _on_download_completed.bind(json_payload))
-	
+
+	# Track this request so _process can poll its byte counts for the toast.
+	_active_download = http
+	_show_progress("Meshy · Downloading model", "Starting…", 0.0)
+
 	# start download
 	var error = http.request(json_payload.url)
 	if error != OK:
 		print("ERROR: download request failed: ", error)
+		_active_download = null
+		_finish_progress("Download failed")
 		http.queue_free()
 
 func _on_download_completed(result, response_code, headers, body, json_payload):
 	print("Download completed: result=", result, " response_code=", response_code, " data_size=", body.size())
-	
+
+	# Stop polling the request for progress and release the node.
+	if _active_download and is_instance_valid(_active_download):
+		_active_download.queue_free()
+	_active_download = null
+
 	if result != HTTPRequest.RESULT_SUCCESS:
 		print("ERROR: download failed: ", result)
+		_finish_progress("Download failed")
 		return
-	
+
 	if response_code != 200:
 		print("ERROR: download response code error: ", response_code)
+		_finish_progress("Download failed (HTTP %d)" % response_code)
 		return
 	
 	# save to project resource directory
@@ -250,6 +372,8 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 
 			# 记下前端请求里的模型名,供 _continue_import 命名导入节点
 			_pending_import_name = json_payload.get("name", "")
+
+			_show_progress("Meshy · Importing", "Processing model…", -1.0)
 
 			# 使用定时器等待文件识别
 			_wait_for_file_recognition(file_path)
@@ -358,6 +482,7 @@ func _continue_import(file_path: String) -> void:
 	
 	# 导入模型
 	_import_model(file_path, json_payload)
+	_finish_progress("Imported: " + name)
 
 func _import_model(file_path, json_payload):
 	print("Preparing to detect and import model: ", file_path)
