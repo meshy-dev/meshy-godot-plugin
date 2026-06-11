@@ -63,15 +63,20 @@ func _ensure_progress_ui() -> void:
 	_progress_panel = PanelContainer.new()
 	_progress_panel.name = "MeshyProgressToast"
 	_progress_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	# Pin to the bottom-right corner, 20px inset, ~320x100.
+	# Pin the panel's bottom-right corner 20px from the editor's bottom-right
+	# corner and let it grow up-left to fit its content, so text is never
+	# clipped regardless of the editor font scale / HiDPI. (A fixed-size rect
+	# was too small for the scaled font and overflowed.)
 	_progress_panel.anchor_left = 1.0
 	_progress_panel.anchor_top = 1.0
 	_progress_panel.anchor_right = 1.0
 	_progress_panel.anchor_bottom = 1.0
-	_progress_panel.offset_left = -340.0
-	_progress_panel.offset_top = -120.0
+	_progress_panel.offset_left = -20.0
+	_progress_panel.offset_top = -20.0
 	_progress_panel.offset_right = -20.0
 	_progress_panel.offset_bottom = -20.0
+	_progress_panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	_progress_panel.grow_vertical = Control.GROW_DIRECTION_BEGIN
 
 	var margin = MarginContainer.new()
 	margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
