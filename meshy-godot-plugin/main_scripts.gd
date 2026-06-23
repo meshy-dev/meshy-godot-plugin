@@ -311,6 +311,61 @@ func _send_json_response(client, data, status_code = 200):
 	client.put_data(response.to_utf8_buffer())
 	client.disconnect_from_host()
 
+# Turn the webapp-supplied model name into a filesystem-safe file/dir name.
+# Reserved characters (\ / : * ? " < > | and control chars) are stripped, but
+# spaces are kept so the folder reads naturally ("Cute Dragon"). Trailing dots
+# and spaces are trimmed because Windows rejects them on folder names.
+func _sanitize_name(raw: String) -> String:
+	var out := raw.strip_edges()
+	for ch in ["/", "\\", ":", "*", "?", "\"", "<", ">", "|", "\n", "\r", "\t"]:
+		out = out.replace(ch, "_")
+	while out.contains("  "):
+		out = out.replace("  ", " ")
+	out = out.strip_edges()
+	while out.ends_with(".") or out.ends_with(" "):
+		out = out.substr(0, out.length() - 1)
+	return out
+
+# Recover a model name from the download URL when the request carries no `name`.
+# The backend already embeds the resolved (family) model name in the signed
+# URL's filename, e.g.
+#   https://assets.meshy.ai/uploads/Meshy_AI_Breeze_Scout_0623093444_texture.glb?Expires=…
+# We strip the query string and extension, then peel off Meshy's "Meshy_AI_"
+# prefix and the trailing "_<timestamp>_<stage>" so it reads as "Breeze Scout".
+# If the filename doesn't match that convention we fall back to the raw basename
+# rather than guessing.
+func _name_from_url(url: String) -> String:
+	if url == "":
+		return ""
+	# Drop the query string, keep the last path segment, strip the extension.
+	var raw := url.split("?")[0].get_file().get_basename()
+	if raw == "":
+		return ""
+	var re := RegEx.new()
+	re.compile("^Meshy_AI_(.+?)_\\d{6,}")
+	var m := re.search(raw)
+	if m:
+		# Underscores stand in for spaces in Meshy's download filenames.
+		return m.get_string(1).replace("_", " ")
+	# Unknown naming convention: use the raw basename as-is.
+	return raw
+
+# Create a dedicated subfolder for one imported model and return its res:// path.
+# On a name clash (re-importing the same model) append _1, _2, … so a new import
+# never clobbers an earlier copy that may still be referenced in a scene.
+func _make_unique_dir(parent_dir: String, base_name: String) -> String:
+	var dir = DirAccess.open(parent_dir)
+	if not dir:
+		# Fallback: return a path without the uniqueness check if the dir won't open.
+		return parent_dir.path_join(base_name)
+	var candidate = base_name
+	var n = 1
+	while dir.dir_exists(candidate):
+		candidate = "%s_%d" % [base_name, n]
+		n += 1
+	dir.make_dir(candidate)
+	return parent_dir.path_join(candidate)
+
 func _download_and_import_file(json_payload):
 	print("Starting file download: ", json_payload.url, " format: ", json_payload.format)
 	
@@ -350,16 +405,33 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 		_finish_progress("Download failed (HTTP %d)" % response_code)
 		return
 	
-	# save to project resource directory
+	# Save into a per-model subfolder named after the model, so each model's mesh
+	# + textures + materials stay grouped under imported_models/<model name>/
+	# instead of a flat pile of timestamp-named files. The webapp already sends
+	# the model name in json_payload.name (the same name used for the node).
 	var res_dir = "res://imported_models"
 	var dir = DirAccess.open("res://")
 	if not dir.dir_exists(res_dir):
 		dir.make_dir(res_dir)
-	
-	# int() so the filename gets a clean unix-second stamp; the raw float would
-	# leave a fractional part (meshy_model_1781147046.00945.glb).
-	var file_name = "meshy_model_" + str(int(Time.get_unix_time_from_system())) + "." + json_payload.format
-	var file_path = res_dir.path_join(file_name)
+
+	var base_name = _sanitize_name(json_payload.get("name", ""))
+	if base_name == "":
+		# No `name` in the request (e.g. an un-renamed remesh/texture child task,
+		# whose name lives only on the root task). Recover it from the download
+		# URL's filename, which the backend names after the model.
+		base_name = _sanitize_name(_name_from_url(json_payload.get("url", "")))
+	if base_name == "":
+		base_name = "Meshy_Model"
+
+	# A fresh subfolder per import (suffixed _1/_2 on name clash). Reuse the
+	# actual folder leaf (e.g. "Breeze Scout_1") for the file AND node names, so a
+	# re-imported same-named model gets a unique, predictable node name that
+	# matches its folder. Otherwise both nodes are "Meshy_Breeze Scout" and Godot
+	# silently auto-dedups the second to "Meshy_Breeze Scout2".
+	var model_dir = _make_unique_dir(res_dir, base_name)
+	var unique_name = model_dir.get_file()
+	var file_name = unique_name + "." + json_payload.format
+	var file_path = model_dir.path_join(file_name)
 	
 	var file = FileAccess.open(file_path, FileAccess.WRITE)
 	if file:
@@ -375,8 +447,9 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 			# fallback on timeout).
 			print("File saved, waiting for Godot to recognize it...")
 
-			# 记下前端请求里的模型名,供 _continue_import 命名导入节点
-			_pending_import_name = json_payload.get("name", "")
+			# Remember the unique folder name so _continue_import names the imported
+			# node to match its folder exactly (including any _1/_2 suffix).
+			_pending_import_name = unique_name
 
 			_show_progress("Meshy · Importing", "Processing model…", -1.0)
 
@@ -803,22 +876,24 @@ func _import_zip(file_path, name):
 		zip_reader.close()
 		return
 
-	# 创建解压目标目录
-	var base_extract_dir = "res://imported_models"
-	var extract_dir_name = "extracted_%s_%d" % [name, Time.get_unix_time_from_system()]
-	var extract_path = base_extract_dir.path_join(extract_dir_name)
-	
+	# Extract into the model's own folder (the directory the downloaded zip was
+	# saved into by _on_download_completed), so the FBX and its textures land
+	# under imported_models/<model name>/ next to each other — not in a separate
+	# extracted_<name>_<timestamp> folder.
+	var extract_path = file_path.get_base_dir()
+
 	var dir_access = DirAccess.open("res://")
 	if not dir_access:
 		print("ERROR: Cannot access resource directory")
 		zip_reader.close()
 		return
-		
-	err = dir_access.make_dir_recursive(extract_path)
-	if err != OK:
-		print("ERROR: Cannot create extraction directory: ", extract_path, " error code: ", err)
-		zip_reader.close()
-		return
+
+	if not DirAccess.dir_exists_absolute(extract_path):
+		err = dir_access.make_dir_recursive(extract_path)
+		if err != OK:
+			print("ERROR: Cannot create extraction directory: ", extract_path, " error code: ", err)
+			zip_reader.close()
+			return
 
 	print("Extracting to directory: ", extract_path)
 
