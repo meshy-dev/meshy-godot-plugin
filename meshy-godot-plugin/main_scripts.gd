@@ -3,8 +3,17 @@ extends CenterContainer
 
 var bridge_running = false
 var tcp_server: TCPServer
-var peerTCP: StreamPeerTCP
+# Connections still receiving their request: [{peer, buf, since}]. Each request
+# keeps its own socket until it is answered.
+var _pending_peers: Array = []
+# The connection waiting for the /import reply (only one import at a time).
+var _import_peer: StreamPeerTCP = null
+var _import_deadline_msec: int = 0
 var server_port = 5325
+const REQUEST_TIMEOUT_MSEC := 10000
+const MAX_REQUEST_BYTES := 1048576
+const DOWNLOAD_TIMEOUT_SEC := 90.0
+const HTTP_REASONS := {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 408: "Request Timeout", 409: "Conflict", 413: "Payload Too Large", 415: "Unsupported Media Type", 500: "Internal Server Error", 502: "Bad Gateway"}
 var editor_interface: EditorInterface
 
 # --- Download / import progress toast (bottom-right editor overlay) ---
@@ -27,11 +36,13 @@ func _ready():
 func _process(_delta):
 	# process request every frame
 	# print(bridge_running, tcp_server, tcp_server.get_local_port(), tcp_server.is_connection_available())
-	if bridge_running and tcp_server and tcp_server.is_connection_available():
-		peerTCP = tcp_server.take_connection()
-	if peerTCP != null:
-		# https://docs.godotengine.org/en/stable/classes/class_streampeertcp.html#class-streampeertcp
-		_handle_peer_tcp()
+	while bridge_running and tcp_server and tcp_server.is_connection_available():
+		_pending_peers.append({"peer": tcp_server.take_connection(), "buf": PackedByteArray(), "since": Time.get_ticks_msec()})
+	for entry in _pending_peers.duplicate():
+		_handle_peer_tcp(entry)
+	# Safety net: if the download callback never answers, still reply before the webapp times out.
+	if _import_peer and Time.get_ticks_msec() > _import_deadline_msec:
+		_reply_import(500, "internal error")
 	# Keep the download/import progress toast in sync each frame.
 	_update_download_progress()
 
@@ -213,33 +224,48 @@ func _on_run_bridge_pressed():
 	# update status label
 	_update_status_label()
 
-func _handle_peer_tcp():
-	# read request
-	var status = peerTCP.get_status()
-	if status == 3: # STATUS_DISCONNECTED
-		peerTCP = null
-	elif status == 2: # STATUS_CONNECTED
-		var code = peerTCP.poll()
-		var bytes := peerTCP.get_available_bytes()
-		if bytes > 0:
-			var data := peerTCP.get_data(bytes)
-			if data[0] == 0: # OK
-				var request_str = _bytes_to_string(data[1])
-				_handle_http_request(request_str)
+func _handle_peer_tcp(entry: Dictionary):
+	# Accumulate bytes until the headers and Content-Length bytes of body have arrived.
+	var peer: StreamPeerTCP = entry.peer
+	peer.poll()
+	var status = peer.get_status()
+	if status != StreamPeerTCP.STATUS_CONNECTED:
+		if status != StreamPeerTCP.STATUS_CONNECTING:
+			_pending_peers.erase(entry)
+		return
+	var bytes := peer.get_available_bytes()
+	if bytes > 0:
+		var data := peer.get_data(bytes)
+		if data[0] == OK:
+			entry.buf = entry.buf + data[1]
+	var buf: PackedByteArray = entry.buf
+	var raw := _bytes_to_string(buf)
+	var header_end := raw.find("\r\n\r\n")
+	var content_length := 0
+	if header_end >= 0:
+		for line in raw.substr(0, header_end).split("\r\n"):
+			if line.to_lower().begins_with("content-length:"):
+				content_length = line.substr(15).strip_edges().to_int()
+	if buf.size() > MAX_REQUEST_BYTES or content_length > MAX_REQUEST_BYTES:
+		_pending_peers.erase(entry)
+		_send_json_response(peer, {"status": "error", "message": "request too large"}, 413)
+	elif header_end >= 0 and buf.size() >= header_end + 4 + content_length:
+		_pending_peers.erase(entry)
+		var body := buf.slice(header_end + 4, header_end + 4 + content_length).get_string_from_utf8()
+		_handle_http_request(peer, raw.substr(0, header_end), body)
+	elif Time.get_ticks_msec() - entry.since > REQUEST_TIMEOUT_MSEC:
+		_pending_peers.erase(entry)
+		_send_json_response(peer, {"status": "error", "message": "request timeout"}, 408)
 
 func _bytes_to_string(bytes: PackedByteArray) -> String:
 	return bytes.get_string_from_ascii()
 
-func _handle_http_request(request_str: String):
-	
-	# parse HTTP request
-	var request_lines = request_str.split("\n")
-	if request_lines.is_empty():
-		return
+func _handle_http_request(peer: StreamPeerTCP, head: String, body: String):
 	
 	# parse request line
-	var request_line = request_lines[0].split(" ")
+	var request_line = head.split("\r\n")[0].split(" ")
 	if request_line.size() < 2:
+		_send_json_response(peer, {"status": "error", "message": "Invalid request format"}, 400)
 		return
 	
 	var method = request_line[0]
@@ -256,35 +282,59 @@ func _handle_http_request(request_str: String):
 			"dcc": "godot",
 			"version": Engine.get_version_info().string
 		}
-		_send_json_response(peerTCP, response, 200)
+		_send_json_response(peer, response, 200)
 	elif  path == "/import":
 		if method == "OPTIONS":
-			_send_cors_headers(peerTCP)
+			_send_cors_headers(peer)
 		elif method == "POST":
-			var body_start = request_str.find("\r\n\r\n") + 4
-			if body_start > 0:
-				var body = request_str.substr(body_start)
-				var json = JSON.parse_string(body)
+			var origin = _get_header(head, "origin")
+			if origin != null and not _origin_allowed(origin):
+				_send_json_response(peer, {"status": "error", "message": "origin not allowed"}, 403)
+				return
+			var json = JSON.parse_string(body)
+			var url = json.get("url") if json is Dictionary else null
+			if not (json is Dictionary):
+				_send_json_response(peer, {"status": "error", "message": "request body must be a JSON object"}, 400)
+			elif not (url is String and (url.begins_with("http://") or url.begins_with("https://"))):
+				_send_json_response(peer, {"status": "error", "message": "url must be an http(s) URL"}, 400)
+			elif _import_peer or _active_download or not _pending_import_path.is_empty():
+				# One import at a time: the download/import pipeline state is single-slot.
+				_send_json_response(peer, {"status": "error", "message": "another import is in progress"}, 409)
+			else:
+				# Answered from _on_download_completed once the file is downloaded and validated.
+				_import_peer = peer
+				_import_deadline_msec = Time.get_ticks_msec() + int(DOWNLOAD_TIMEOUT_SEC + 10.0) * 1000
 				_download_and_import_file(json)
-				# wait 2 seconds
-				await get_tree().create_timer(2.0).timeout
-				_send_json_response(peerTCP, {
-					"status": "ok",
-					"message": "File imported successfully"
-				}, 200)
 		else:
 			# return error response
 			response = {
 				"status": "error",
 				"message": "Invalid request format"
 			}
-			_send_json_response(peerTCP, response, 400)
+			_send_json_response(peer, response, 400)
 	else:
 		# return 404 response
 		response = {
 			"status": "path not found"
 		}
-		_send_json_response(peerTCP, response, 404)
+		_send_json_response(peer, response, 404)
+
+# Returns the header value, or null when the header is absent.
+func _get_header(head: String, name: String) -> Variant:
+	for line in head.split("\r\n"):
+		if line.to_lower().begins_with(name + ":"):
+			return line.substr(name.length() + 1).strip_edges()
+	return null
+
+# Web origins allowed to trigger an import: https meshy.ai / meshy.cn and their
+# subdomains (no port, path or userinfo).
+func _origin_allowed(origin: String) -> bool:
+	return RegEx.create_from_string("^https://([a-z0-9-]+\\.)*meshy\\.(ai|cn)$").search(origin.to_lower()) != null
+
+func _reply_import(status_code: int, message: String) -> void:
+	if _import_peer:
+		_send_json_response(_import_peer, {"status": "ok" if status_code == 200 else "error", "message": message}, status_code)
+	_import_peer = null
 
 func _send_cors_headers(client):
 	var response = "HTTP/1.1 200 OK\r\n"
@@ -299,12 +349,12 @@ func _send_cors_headers(client):
 
 func _send_json_response(client, data, status_code = 200):
 	var json = JSON.stringify(data)
-	var response = "HTTP/1.1 " + str(status_code) + " OK\r\n"
+	var response = "HTTP/1.1 %d %s\r\n" % [status_code, HTTP_REASONS.get(status_code, "Error")]
 	response += "Content-Type: application/json\r\n"
 	response += "Access-Control-Allow-Origin: *\r\n"
 	response += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
 	response += "Access-Control-Allow-Headers: *\r\n"
-	response += "Content-Length: " + str(json.length()) + "\r\n"
+	response += "Content-Length: " + str(json.to_utf8_buffer().size()) + "\r\n"
 	response += "\r\n"
 	response += json
 	
@@ -367,7 +417,7 @@ func _make_unique_dir(parent_dir: String, base_name: String) -> String:
 	return parent_dir.path_join(candidate)
 
 func _download_and_import_file(json_payload):
-	print("Starting file download: ", json_payload.url, " format: ", json_payload.format)
+	print("Starting file download: ", json_payload.url, " format: ", json_payload.get("format"))
 	
 	# download file
 	var http = HTTPRequest.new()
@@ -380,12 +430,14 @@ func _download_and_import_file(json_payload):
 	_show_progress("Meshy · Downloading model", "Starting…", 0.0)
 
 	# start download
+	http.timeout = DOWNLOAD_TIMEOUT_SEC
 	var error = http.request(json_payload.url)
 	if error != OK:
 		print("ERROR: download request failed: ", error)
 		_active_download = null
 		_finish_progress("Download failed")
 		http.queue_free()
+		_reply_import(502, "download failed: network error")
 
 func _on_download_completed(result, response_code, headers, body, json_payload):
 	print("Download completed: result=", result, " response_code=", response_code, " data_size=", body.size())
@@ -398,11 +450,20 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 	if result != HTTPRequest.RESULT_SUCCESS:
 		print("ERROR: download failed: ", result)
 		_finish_progress("Download failed")
+		_reply_import(502, "download failed: timeout" if result == HTTPRequest.RESULT_TIMEOUT else "download failed: network error")
 		return
 
-	if response_code != 200:
+	if response_code < 200 or response_code >= 300:
 		print("ERROR: download response code error: ", response_code)
 		_finish_progress("Download failed (HTTP %d)" % response_code)
+		_reply_import(502, "download failed: HTTP %d" % response_code)
+		return
+
+	var detected_format = _detect_format(body)
+	if detected_format.is_empty():
+		print("ERROR: Unknown or unsupported file format. Magic bytes: ", body.slice(0, 21).hex_encode())
+		_finish_progress("Unsupported file format")
+		_reply_import(415, "unsupported file format")
 		return
 	
 	# Save into a per-model subfolder named after the model, so each model's mesh
@@ -414,7 +475,8 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 	if not dir.dir_exists(res_dir):
 		dir.make_dir(res_dir)
 
-	var base_name = _sanitize_name(json_payload.get("name", ""))
+	var raw_name = json_payload.get("name")
+	var base_name = _sanitize_name(raw_name if raw_name is String else "")
 	if base_name == "":
 		# No `name` in the request (e.g. an un-renamed remesh/texture child task,
 		# whose name lives only on the root task). Recover it from the download
@@ -430,7 +492,10 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 	# silently auto-dedups the second to "Meshy_Breeze Scout2".
 	var model_dir = _make_unique_dir(res_dir, base_name)
 	var unique_name = model_dir.get_file()
-	var file_name = unique_name + "." + json_payload.format
+	var ext = str(json_payload.get("format", ""))
+	if not ext.is_valid_identifier():
+		ext = detected_format
+	var file_name = unique_name + "." + ext
 	var file_path = model_dir.path_join(file_name)
 	
 	var file = FileAccess.open(file_path, FileAccess.WRITE)
@@ -452,13 +517,16 @@ func _on_download_completed(result, response_code, headers, body, json_payload):
 			_pending_import_name = unique_name
 
 			_show_progress("Meshy · Importing", "Processing model…", -1.0)
+			_reply_import(200, "File downloaded, importing into Godot")
 
 			# 使用定时器等待文件识别
 			_wait_for_file_recognition(file_path)
 		else:
 			print("ERROR: file not found: ", file_path)
+			_reply_import(500, "cannot save model file")
 	else:
 		print("ERROR: cannot save file: ", file_path)
+		_reply_import(500, "cannot save model file")
 
 # 存储待导入的文件路径和重试信息
 var _pending_import_path: String = ""
@@ -562,18 +630,8 @@ func _continue_import(file_path: String) -> void:
 	_import_model(file_path, json_payload)
 	_finish_progress("Imported: " + name)
 
-func _import_model(file_path, json_payload):
-	print("Preparing to detect and import model: ", file_path)
-	
-	var file = FileAccess.open(file_path, FileAccess.READ)
-	if not file:
-		print("ERROR: Cannot open file for type detection: ", file_path)
-		return
-		
-	# 读取文件头部的魔数 (读取更多字节以检测FBX)
-	var magic_bytes = file.get_buffer(21) # FBX magic number is 21 bytes long
-	file.close() # 检测后关闭文件
-	
+# Detect fbx / glb / zip from the file's leading magic bytes; "" if unsupported.
+func _detect_format(magic_bytes: PackedByteArray) -> String:
 	var detected_format = ""
 	
 	if magic_bytes.size() >= 21: # Check for FBX magic number
@@ -590,7 +648,22 @@ func _import_model(file_path, json_payload):
 			# 检查ZIP魔数 "PK" (0x504B) - 只需要前两个字节
 			elif magic_bytes[0] == 0x50 and magic_bytes[1] == 0x4B:
 				detected_format = "zip"
-			
+	return detected_format
+
+func _import_model(file_path, json_payload):
+	print("Preparing to detect and import model: ", file_path)
+	
+	var file = FileAccess.open(file_path, FileAccess.READ)
+	if not file:
+		print("ERROR: Cannot open file for type detection: ", file_path)
+		return
+		
+	# 读取文件头部的魔数 (读取更多字节以检测FBX)
+	var magic_bytes = file.get_buffer(21) # FBX magic number is 21 bytes long
+	file.close() # 检测后关闭文件
+	
+	var detected_format = _detect_format(magic_bytes)
+	
 	if detected_format.is_empty():
 		print("ERROR: Unknown or unsupported file format. Magic bytes: ", magic_bytes.hex_encode())
 		return
